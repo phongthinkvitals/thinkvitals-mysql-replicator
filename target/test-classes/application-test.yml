@@ -1,0 +1,12 @@
+replication:
+  serverId: 998877
+  useGtid: false
+  snapshotMode: initial
+  ddlEnabled: true
+  dmlEnabled: true
+  excludeTables:
+    - replication_checkpoint
+  requirePrimaryKey: true
+retry:
+  maxAttempts: 3
+  backoffMs: 500

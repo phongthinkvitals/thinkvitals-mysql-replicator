@@ -1,0 +1,42 @@
+app:
+  name: mysql-binlog-replicator
+
+source:
+  url: jdbc:mysql://localhost:3309/thinkvitals?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+  username: root
+  password: password
+
+sink:
+  url: jdbc:mysql://localhost:3310/thinkvitals?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+  username: root
+  password: password
+
+replication:
+  serverId: 987654
+  useGtid: true
+  snapshotMode: initial
+  ddlEnabled: true
+  # false = relaxed sink DDL: keep columns and primary key, skip FK/unique/index/check constraints.
+  # true = strict sink DDL: apply source DDL as-is after source/sink schema mapping.
+  strictDdl: false
+  dmlEnabled: true
+  includeTables: []
+  excludeTables:
+    - flyway_schema_history
+    - replication_checkpoint
+  onDuplicateInsert: upsert
+  requirePrimaryKey: true
+
+retry:
+  maxAttempts: 5
+  backoffMs: 3000
+
+monitoring:
+  port: 8080
+
+server:
+  port: ${monitoring.port}
+
+logging:
+  level:
+    com.example.replicator: INFO
