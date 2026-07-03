@@ -1,19 +1,20 @@
-package com.example.replicator;
+package com.example.replicator.util;
 
+import com.example.replicator.config.ReplicatorProperties;
 import org.slf4j.Logger;
 
 import java.util.concurrent.Callable;
 
-class Retryer {
+public class Retryer {
     private final int maxAttempts;
     private final long backoffMs;
 
-    Retryer(ReplicatorProperties.Retry retry) {
+    public Retryer(ReplicatorProperties.Retry retry) {
         this.maxAttempts = retry.getMaxAttempts();
         this.backoffMs = retry.getBackoffMs();
     }
 
-    <T> T call(String operation, Logger log, Callable<T> callable) throws Exception {
+    public <T> T call(String operation, Logger log, Callable<T> callable) throws Exception {
         Exception last = null;
         for (int attempt = 1; attempt <= maxAttempts; attempt++) {
             try {
@@ -29,14 +30,14 @@ class Retryer {
         throw last;
     }
 
-    void run(String operation, Logger log, ThrowingRunnable runnable) throws Exception {
+    public void run(String operation, Logger log, ThrowingRunnable runnable) throws Exception {
         call(operation, log, () -> {
             runnable.run();
             return null;
         });
     }
 
-    interface ThrowingRunnable {
+    public interface ThrowingRunnable {
         void run() throws Exception;
     }
 }

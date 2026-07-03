@@ -1,9 +1,9 @@
-package com.example.replicator;
+package com.example.replicator.model;
 
 import java.time.Instant;
 import java.util.List;
 
-record TableVerificationStatus(
+public record TableVerificationStatus(
         String table,
         boolean comparable,
         boolean matched,

@@ -1,4 +1,4 @@
-package com.example.replicator;
+package com.example.replicator.config;
 
 import com.zaxxer.hikari.HikariDataSource;
 import org.springframework.beans.factory.annotation.Qualifier;

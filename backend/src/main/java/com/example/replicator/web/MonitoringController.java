@@ -1,5 +1,10 @@
-package com.example.replicator;
+package com.example.replicator.web;
 
+import com.example.replicator.model.ReplicationStatus;
+import com.example.replicator.model.ReplicationVerificationSummary;
+import com.example.replicator.model.TableVerificationStatus;
+import com.example.replicator.service.ReplicationService;
+import com.example.replicator.service.VerificationService;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestParam;

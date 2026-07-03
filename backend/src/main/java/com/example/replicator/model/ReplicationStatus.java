@@ -1,4 +1,4 @@
-package com.example.replicator;
+package com.example.replicator.model;
 
 import java.time.LocalDateTime;
 

@@ -1,5 +1,9 @@
-package com.example.replicator;
+package com.example.replicator.replication;
 
+import com.example.replicator.metadata.MetadataService;
+import com.example.replicator.model.BinlogPosition;
+import com.example.replicator.schema.DdlSanitizer;
+import com.example.replicator.service.CheckpointService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -15,28 +19,28 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 @Service
-class DdlApplier {
+public class DdlApplier {
     private static final Logger log = LoggerFactory.getLogger(DdlApplier.class);
     private static final Pattern FIRST_QUOTED_NAME = Pattern.compile("`(?:[^`]+`\\.)?([^`]+)`");
 
-    private final JdbcTemplate sink;
+    private final JdbcTemplate sinkJdbcTemplate;
     private final CheckpointService checkpointService;
     private final MetadataService metadataService;
-    private final String sourceDb;
-    private final String sinkDb;
+    private final String sourceDatabaseName;
+    private final String sinkDatabaseName;
 
-    DdlApplier(@Qualifier("sinkJdbcTemplate") JdbcTemplate sink,
+    public DdlApplier(@Qualifier("sinkJdbcTemplate") JdbcTemplate sinkJdbcTemplate,
                CheckpointService checkpointService,
                MetadataService metadataService) {
-        this.sink = sink;
+        this.sinkJdbcTemplate = sinkJdbcTemplate;
         this.checkpointService = checkpointService;
         this.metadataService = metadataService;
-        this.sourceDb = checkpointService.sourceEndpoint().database();
-        this.sinkDb = checkpointService.sinkEndpoint().database();
+        this.sourceDatabaseName = checkpointService.sourceEndpoint().database();
+        this.sinkDatabaseName = checkpointService.sinkEndpoint().database();
     }
 
-    void apply(String sql, BinlogPosition position) {
-        Optional<String> prepared = DdlSanitizer.prepare(sql, sourceDb, sinkDb,
+    public void apply(String sql, BinlogPosition position) {
+        Optional<String> prepared = DdlSanitizer.prepare(sql, sourceDatabaseName, sinkDatabaseName,
                 checkpointService.properties().getReplication().isStrictDdl());
         long start = System.currentTimeMillis();
         if (prepared.isEmpty()) {
@@ -49,7 +53,7 @@ class DdlApplier {
         }
         String mapped = prepared.get();
         try {
-            sink.execute(mapped);
+            sinkJdbcTemplate.execute(mapped);
             metadataService.invalidate(null);
             checkpointService.save(position);
             checkpointService.saveTableEvents(Collections.singletonList(tableName(sql)), position);
@@ -62,7 +66,7 @@ class DdlApplier {
             metadataService.invalidate(null);
             checkpointService.save(position);
             checkpointService.saveTableEvents(Collections.singletonList(tableName(sql)), position);
-            log.warn("Skipped CREATE TABLE because sink table already exists sql=\"{}\" binlog={}:{} durationMs={}",
+            log.warn("Skipped CREATE TABLE because sinkJdbcTemplate table already exists sql=\"{}\" binlog={}:{} durationMs={}",
                     mapped, position.binlogFile(), position.binlogPosition(), System.currentTimeMillis() - start);
         }
     }

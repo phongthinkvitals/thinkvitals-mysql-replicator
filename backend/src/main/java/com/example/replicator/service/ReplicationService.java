@@ -1,5 +1,13 @@
-package com.example.replicator;
+package com.example.replicator.service;
 
+import com.example.replicator.model.BinlogPosition;
+import com.example.replicator.model.ReplicationStatus;
+import com.example.replicator.replication.DdlApplier;
+import com.example.replicator.replication.DmlApplier;
+import com.example.replicator.replication.RowChange;
+import com.example.replicator.sql.TableFilter;
+import com.example.replicator.util.JdbcUrlParser;
+import com.example.replicator.util.Retryer;
 import com.github.shyiko.mysql.binlog.BinaryLogClient;
 import com.github.shyiko.mysql.binlog.event.DeleteRowsEventData;
 import com.github.shyiko.mysql.binlog.event.Event;

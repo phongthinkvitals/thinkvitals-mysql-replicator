@@ -1,8 +1,8 @@
-package com.example.replicator;
+package com.example.replicator.model;
 
 import java.time.LocalDateTime;
 
-record BinlogPosition(
+public record BinlogPosition(
         String binlogFile,
         Long binlogPosition,
         String gtidSet,
@@ -11,12 +11,12 @@ record BinlogPosition(
         LocalDateTime lastEventTime,
         String sourceDatabase
 ) {
-    BinlogPosition(String binlogFile,
-                   Long binlogPosition,
-                   String gtidSet,
-                   String lastEventType,
-                   String lastTableName,
-                   LocalDateTime lastEventTime) {
+    public BinlogPosition(String binlogFile,
+                          Long binlogPosition,
+                          String gtidSet,
+                          String lastEventType,
+                          String lastTableName,
+                          LocalDateTime lastEventTime) {
         this(binlogFile, binlogPosition, gtidSet, lastEventType, lastTableName, lastEventTime, null);
     }
 }

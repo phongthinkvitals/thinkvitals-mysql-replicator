@@ -1,4 +1,4 @@
-package com.example.replicator;
+package com.example.replicator.config;
 
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;

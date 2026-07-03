@@ -1,5 +1,11 @@
-package com.example.replicator;
+package com.example.replicator.service;
 
+import com.example.replicator.metadata.MetadataService;
+import com.example.replicator.model.ReplicationVerificationSummary;
+import com.example.replicator.model.TableMetadata;
+import com.example.replicator.model.TableVerificationStatus;
+import com.example.replicator.sql.SqlNames;
+import com.example.replicator.sql.TableFilter;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
@@ -12,39 +18,39 @@ import java.util.Map;
 import java.util.regex.Pattern;
 
 @Service
-class VerificationService {
+public class VerificationService {
     private static final Pattern SAFE_TABLE_NAME = Pattern.compile("[A-Za-z0-9_]+");
 
-    private final JdbcTemplate source;
-    private final JdbcTemplate sink;
+    private final JdbcTemplate sourceJdbcTemplate;
+    private final JdbcTemplate sinkJdbcTemplate;
     private final MetadataService metadataService;
     private final CheckpointService checkpointService;
     private final TableFilter tableFilter;
-    private final String sourceDb;
-    private final String sinkDb;
+    private final String sourceDatabaseName;
+    private final String sinkDatabaseName;
 
-    VerificationService(@Qualifier("sourceJdbcTemplate") JdbcTemplate source,
-                        @Qualifier("sinkJdbcTemplate") JdbcTemplate sink,
+    public VerificationService(@Qualifier("sourceJdbcTemplate") JdbcTemplate sourceJdbcTemplate,
+                        @Qualifier("sinkJdbcTemplate") JdbcTemplate sinkJdbcTemplate,
                         MetadataService metadataService,
                         CheckpointService checkpointService) {
-        this.source = source;
-        this.sink = sink;
+        this.sourceJdbcTemplate = sourceJdbcTemplate;
+        this.sinkJdbcTemplate = sinkJdbcTemplate;
         this.metadataService = metadataService;
         this.checkpointService = checkpointService;
         this.tableFilter = new TableFilter(checkpointService.properties().getReplication());
-        this.sourceDb = checkpointService.sourceEndpoint().database();
-        this.sinkDb = checkpointService.sinkEndpoint().database();
+        this.sourceDatabaseName = checkpointService.sourceEndpoint().database();
+        this.sinkDatabaseName = checkpointService.sinkEndpoint().database();
     }
 
-    ReplicationVerificationSummary verifyAll(Integer limit) {
+    public ReplicationVerificationSummary verifyAll(Integer limit) {
         Integer normalizedLimit = limit != null && limit > 0 ? limit : null;
-        List<String> tables = source.query("""
+        List<String> tables = sourceJdbcTemplate.query("""
                         SELECT TABLE_NAME
                         FROM INFORMATION_SCHEMA.TABLES
                         WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE'
                         ORDER BY TABLE_NAME
                         """,
-                (rs, rowNum) -> rs.getString(1), sourceDb);
+                (rs, rowNum) -> rs.getString(1), sourceDatabaseName);
         List<TableVerificationStatus> results = new ArrayList<>();
         for (String table : tables) {
             if (!tableFilter.accepts(table)) {
@@ -77,7 +83,7 @@ class VerificationService {
                 notComparableTables, normalizedLimit, results, Instant.now());
     }
 
-    TableVerificationStatus verifyTable(String table, Integer limit) {
+    public TableVerificationStatus verifyTable(String table, Integer limit) {
         validateTable(table);
         Integer normalizedLimit = limit != null && limit > 0 ? limit : null;
         TableMetadata metadata = metadataService.table(table);
@@ -96,8 +102,8 @@ class VerificationService {
             return result;
         }
 
-        HashResult sourceHash = hash(source, sourceDb, table, metadata, normalizedLimit);
-        HashResult sinkHash = hash(sink, sinkDb, table, metadata, normalizedLimit);
+        HashResult sourceHash = hash(sourceJdbcTemplate, sourceDatabaseName, table, metadata, normalizedLimit);
+        HashResult sinkHash = hash(sinkJdbcTemplate, sinkDatabaseName, table, metadata, normalizedLimit);
         boolean matched = sourceHash.rows() == sinkHash.rows()
                 && sourceHash.xorChecksum().equals(sinkHash.xorChecksum())
                 && sourceHash.sumChecksum().equals(sinkHash.sumChecksum());
@@ -118,12 +124,12 @@ class VerificationService {
     }
 
     private String mismatchNote(TableVerificationStatus result) {
-        return "Verification mismatch rows source=" + result.sourceRows()
-                + " sink=" + result.sinkRows()
-                + " checksum source=" + result.sourceChecksum()
-                + " sink=" + result.sinkChecksum()
-                + " sum source=" + result.sourceSum()
-                + " sink=" + result.sinkSum();
+        return "Verification mismatch rows sourceJdbcTemplate=" + result.sourceRows()
+                + " sinkJdbcTemplate=" + result.sinkRows()
+                + " checksum sourceJdbcTemplate=" + result.sourceChecksum()
+                + " sinkJdbcTemplate=" + result.sinkChecksum()
+                + " sum sourceJdbcTemplate=" + result.sourceSum()
+                + " sinkJdbcTemplate=" + result.sinkSum();
     }
 
     private void validateTable(String table) {

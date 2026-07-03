@@ -1,18 +1,20 @@
-package com.example.replicator;
+package com.example.replicator.sql;
+
+import com.example.replicator.config.ReplicatorProperties;
 
 import java.util.HashSet;
 import java.util.Set;
 
-class TableFilter {
+public class TableFilter {
     private final Set<String> includes;
     private final Set<String> excludes;
 
-    TableFilter(ReplicatorProperties.Replication replication) {
+    public TableFilter(ReplicatorProperties.Replication replication) {
         this.includes = new HashSet<>(replication.getIncludeTables());
         this.excludes = new HashSet<>(replication.getExcludeTables());
     }
 
-    boolean accepts(String table) {
+    public boolean accepts(String table) {
         if (!includes.isEmpty() && !includes.contains(table)) {
             return false;
         }

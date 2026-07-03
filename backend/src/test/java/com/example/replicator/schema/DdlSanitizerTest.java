@@ -1,4 +1,4 @@
-package com.example.replicator;
+package com.example.replicator.schema;
 
 import org.junit.jupiter.api.Test;
 

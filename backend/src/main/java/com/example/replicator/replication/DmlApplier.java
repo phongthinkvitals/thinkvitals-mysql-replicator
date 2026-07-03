@@ -1,5 +1,10 @@
-package com.example.replicator;
+package com.example.replicator.replication;
 
+import com.example.replicator.metadata.MetadataService;
+import com.example.replicator.model.BinlogPosition;
+import com.example.replicator.model.TableMetadata;
+import com.example.replicator.service.CheckpointService;
+import com.example.replicator.sql.SqlNames;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -24,28 +29,28 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 @Service
-class DmlApplier {
+public class DmlApplier {
     private static final Logger log = LoggerFactory.getLogger(DmlApplier.class);
     private static final Pattern DATA_TOO_LONG_COLUMN = Pattern.compile("Data too long for column '([^']+)'");
 
     private final DataSource sinkDataSource;
-    private final JdbcTemplate sink;
+    private final JdbcTemplate sinkJdbcTemplate;
     private final CheckpointService checkpointService;
     private final MetadataService metadataService;
-    private final String sinkDb;
+    private final String sinkDatabaseName;
 
-    DmlApplier(@Qualifier("sinkDataSource") DataSource sinkDataSource,
-               @Qualifier("sinkJdbcTemplate") JdbcTemplate sink,
+    public DmlApplier(@Qualifier("sinkDataSource") DataSource sinkDataSource,
+               @Qualifier("sinkJdbcTemplate") JdbcTemplate sinkJdbcTemplate,
                CheckpointService checkpointService,
                MetadataService metadataService) {
         this.sinkDataSource = sinkDataSource;
-        this.sink = sink;
+        this.sinkJdbcTemplate = sinkJdbcTemplate;
         this.checkpointService = checkpointService;
         this.metadataService = metadataService;
-        this.sinkDb = checkpointService.sinkEndpoint().database();
+        this.sinkDatabaseName = checkpointService.sinkEndpoint().database();
     }
 
-    void applyTransaction(List<RowChange> changes, BinlogPosition commitPosition) throws Exception {
+    public void applyTransaction(List<RowChange> changes, BinlogPosition commitPosition) throws Exception {
         if (changes.isEmpty()) {
             checkpointService.save(commitPosition);
             return;
@@ -158,7 +163,7 @@ class DmlApplier {
     private void applyInsert(Connection connection, TableMetadata metadata, Object[] values) throws Exception {
         String columns = String.join(",", metadata.columns().stream().map(SqlNames::quote).toList());
         String placeholders = String.join(",", metadata.columns().stream().map(c -> "?").toList());
-        String sql = "INSERT INTO " + SqlNames.qualified(sinkDb, metadata.table()) + " (" + columns + ") VALUES (" + placeholders + ")";
+        String sql = "INSERT INTO " + SqlNames.qualified(sinkDatabaseName, metadata.table()) + " (" + columns + ") VALUES (" + placeholders + ")";
         if ("upsert".equalsIgnoreCase(checkpointService.properties().getReplication().getOnDuplicateInsert())) {
             StringJoiner update = new StringJoiner(",");
             for (String column : metadata.columns()) {
@@ -180,7 +185,7 @@ class DmlApplier {
             }
         }
         String where = pkWhere(metadata);
-        String sql = "UPDATE " + SqlNames.qualified(sinkDb, metadata.table()) + " SET " + set + " WHERE " + where;
+        String sql = "UPDATE " + SqlNames.qualified(sinkDatabaseName, metadata.table()) + " SET " + set + " WHERE " + where;
         try (PreparedStatement ps = connection.prepareStatement(sql)) {
             int index = 1;
             for (String column : metadata.columns()) {
@@ -191,19 +196,19 @@ class DmlApplier {
             bindPrimaryKeys(ps, metadata, before, index);
             int affected = ps.executeUpdate();
             if (affected == 0) {
-                log.warn("UPDATE found no sink row table={}, applying after image as insert", metadata.table());
+                log.warn("UPDATE found no sinkJdbcTemplate row table={}, applying after image as insert", metadata.table());
                 applyInsert(connection, metadata, after);
             }
         }
     }
 
     private void applyDelete(Connection connection, TableMetadata metadata, Object[] before) throws Exception {
-        String sql = "DELETE FROM " + SqlNames.qualified(sinkDb, metadata.table()) + " WHERE " + pkWhere(metadata);
+        String sql = "DELETE FROM " + SqlNames.qualified(sinkDatabaseName, metadata.table()) + " WHERE " + pkWhere(metadata);
         try (PreparedStatement ps = connection.prepareStatement(sql)) {
             bindPrimaryKeys(ps, metadata, before, 1);
             int affected = ps.executeUpdate();
             if (affected == 0) {
-                log.warn("DELETE found no sink row table={}", metadata.table());
+                log.warn("DELETE found no sinkJdbcTemplate row table={}", metadata.table());
             }
         }
     }

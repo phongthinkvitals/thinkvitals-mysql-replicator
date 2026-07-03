@@ -1,5 +1,9 @@
-package com.example.replicator;
+package com.example.replicator.service;
 
+import com.example.replicator.model.BinlogPosition;
+import com.example.replicator.schema.DdlSanitizer;
+import com.example.replicator.sql.SqlNames;
+import com.example.replicator.sql.TableFilter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -25,33 +29,33 @@ import java.util.Set;
 public class SnapshotService {
     private static final Logger log = LoggerFactory.getLogger(SnapshotService.class);
 
-    private final JdbcTemplate source;
-    private final JdbcTemplate sink;
+    private final JdbcTemplate sourceJdbcTemplate;
+    private final JdbcTemplate sinkJdbcTemplate;
     private final DataSource sourceDataSource;
     private final DataSource sinkDataSource;
     private final CheckpointService checkpointService;
     private final TableFilter tableFilter;
-    private final String sourceDb;
-    private final String sinkDb;
+    private final String sourceDatabaseName;
+    private final String sinkDatabaseName;
     private final boolean strictDdl;
 
-    public SnapshotService(@Qualifier("sourceJdbcTemplate") JdbcTemplate source,
-                           @Qualifier("sinkJdbcTemplate") JdbcTemplate sink,
+    public SnapshotService(@Qualifier("sourceJdbcTemplate") JdbcTemplate sourceJdbcTemplate,
+                           @Qualifier("sinkJdbcTemplate") JdbcTemplate sinkJdbcTemplate,
                            @Qualifier("sourceDataSource") DataSource sourceDataSource,
                            @Qualifier("sinkDataSource") DataSource sinkDataSource,
                            CheckpointService checkpointService) {
-        this.source = source;
-        this.sink = sink;
+        this.sourceJdbcTemplate = sourceJdbcTemplate;
+        this.sinkJdbcTemplate = sinkJdbcTemplate;
         this.sourceDataSource = sourceDataSource;
         this.sinkDataSource = sinkDataSource;
         this.checkpointService = checkpointService;
         this.tableFilter = new TableFilter(checkpointService.properties().getReplication());
-        this.sourceDb = checkpointService.sourceEndpoint().database();
-        this.sinkDb = checkpointService.sinkEndpoint().database();
+        this.sourceDatabaseName = checkpointService.sourceEndpoint().database();
+        this.sinkDatabaseName = checkpointService.sinkEndpoint().database();
         this.strictDdl = checkpointService.properties().getReplication().isStrictDdl();
     }
 
-    BinlogPosition runIfNeeded() throws Exception {
+    public BinlogPosition runIfNeeded() throws Exception {
         var checkpoint = checkpointService.load();
         if (checkpoint.isPresent()
                 || !"initial".equalsIgnoreCase(checkpointService.properties().getReplication().getSnapshotMode())) {
@@ -61,7 +65,7 @@ public class SnapshotService {
             return checkpoint.orElse(null);
         }
 
-        log.info("No checkpoint found for source database {}; running initial snapshot", sourceDb);
+        log.info("No checkpoint found for sourceJdbcTemplate database {}; running initial snapshot", sourceDatabaseName);
         try (Connection lockConnection = sourceDataSource.getConnection()) {
             boolean locked = tryReadLock(lockConnection);
             if (!locked) {
@@ -123,7 +127,7 @@ public class SnapshotService {
                 gtid = rs.getString(1);
             }
         } catch (Exception e) {
-            log.info("GTID is not available on source: {}", e.getMessage());
+            log.info("GTID is not available on sourceJdbcTemplate: {}", e.getMessage());
         }
         return new BinlogPosition(file, position, gtid, "SNAPSHOT", null, LocalDateTime.now());
     }
@@ -147,12 +151,12 @@ public class SnapshotService {
     }
 
     private void createSinkDatabase() {
-        sink.execute("CREATE DATABASE IF NOT EXISTS " + SqlNames.quote(sinkDb));
+        sinkJdbcTemplate.execute("CREATE DATABASE IF NOT EXISTS " + SqlNames.quote(sinkDatabaseName));
     }
 
     private List<String> listTables() {
-        List<String> tables = source.query("SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE'",
-                (rs, rowNum) -> rs.getString(1), sourceDb);
+        List<String> tables = sourceJdbcTemplate.query("SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE'",
+                (rs, rowNum) -> rs.getString(1), sourceDatabaseName);
         return orderTablesByForeignKeys(tables);
     }
 
@@ -163,7 +167,7 @@ public class SnapshotService {
             dependencies.put(table, new LinkedHashSet<>());
         }
 
-        source.query("""
+        sourceJdbcTemplate.query("""
                         SELECT TABLE_NAME, REFERENCED_TABLE_NAME
                         FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
                         WHERE TABLE_SCHEMA = ?
@@ -177,7 +181,7 @@ public class SnapshotService {
                         dependencies.get(table).add(referencedTable);
                     }
                 },
-                sourceDb, sourceDb);
+                sourceDatabaseName, sourceDatabaseName);
 
         List<String> ordered = new ArrayList<>();
         Set<String> visiting = new HashSet<>();
@@ -207,31 +211,31 @@ public class SnapshotService {
 
     private void createOrReplaceTable(String table) {
         if (sinkTableExists(table)) {
-            log.info("Skipped snapshot DDL because sink table already exists table={}", table);
+            log.info("Skipped snapshot DDL because sinkJdbcTemplate table already exists table={}", table);
             return;
         }
-        Map<String, Object> row = source.queryForMap("SHOW CREATE TABLE " + SqlNames.qualified(sourceDb, table));
+        Map<String, Object> row = sourceJdbcTemplate.queryForMap("SHOW CREATE TABLE " + SqlNames.qualified(sourceDatabaseName, table));
         String ddl = String.valueOf(row.get("Create Table"));
-        ddl = DdlSanitizer.prepare(ddl, sourceDb, sinkDb, strictDdl)
+        ddl = DdlSanitizer.prepare(ddl, sourceDatabaseName, sinkDatabaseName, strictDdl)
                 .orElseThrow(() -> new IllegalStateException("CREATE TABLE DDL was skipped for table " + table));
         try {
-            sink.execute(ddl);
+            sinkJdbcTemplate.execute(ddl);
         } catch (RuntimeException e) {
             if (!isTableAlreadyExists(e)) {
                 throw e;
             }
-            log.info("Skipped snapshot DDL because sink table already exists table={}", table);
+            log.info("Skipped snapshot DDL because sinkJdbcTemplate table already exists table={}", table);
         }
         log.info("Applied snapshot DDL table={}", table);
     }
 
     private boolean sinkTableExists(String table) {
-        Integer count = sink.queryForObject("""
+        Integer count = sinkJdbcTemplate.queryForObject("""
                         SELECT COUNT(*)
                         FROM INFORMATION_SCHEMA.TABLES
                         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND TABLE_TYPE = 'BASE TABLE'
                         """,
-                Integer.class, sinkDb, table);
+                Integer.class, sinkDatabaseName, table);
         return count != null && count > 0;
     }
 
@@ -256,14 +260,14 @@ public class SnapshotService {
         try (Connection sourceConnection = sourceDataSource.getConnection();
              Connection sinkConnection = sinkDataSource.getConnection();
              PreparedStatement read = sourceConnection.prepareStatement(
-                     "SELECT " + selectColumns + " FROM " + SqlNames.qualified(sourceDb, table),
+                     "SELECT " + selectColumns + " FROM " + SqlNames.qualified(sourceDatabaseName, table),
                      ResultSet.TYPE_FORWARD_ONLY,
                      ResultSet.CONCUR_READ_ONLY)) {
             read.setFetchSize(Integer.MIN_VALUE);
             try (ResultSet rs = read.executeQuery()) {
                 String placeholders = String.join(",", columns.stream().map(c -> "?").toList());
                 String columnSql = String.join(",", columns.stream().map(SqlNames::quote).toList());
-                String sql = "REPLACE INTO " + SqlNames.qualified(sinkDb, table) + " (" + columnSql + ") VALUES (" + placeholders + ")";
+                String sql = "REPLACE INTO " + SqlNames.qualified(sinkDatabaseName, table) + " (" + columnSql + ") VALUES (" + placeholders + ")";
                 sinkConnection.setAutoCommit(false);
                 int count = 0;
                 try (PreparedStatement write = sinkConnection.prepareStatement(sql)) {
@@ -293,14 +297,14 @@ public class SnapshotService {
     }
 
     private List<String> writableColumns(String table) {
-        return source.query("""
+        return sourceJdbcTemplate.query("""
                         SELECT COLUMN_NAME
                         FROM INFORMATION_SCHEMA.COLUMNS
                         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
                           AND EXTRA NOT LIKE '%GENERATED%'
                         ORDER BY ORDINAL_POSITION
                         """,
-                (rs, rowNum) -> rs.getString(1), sourceDb, table);
+                (rs, rowNum) -> rs.getString(1), sourceDatabaseName, table);
     }
 
     private record SourceLogStatus(String file, Long position) {

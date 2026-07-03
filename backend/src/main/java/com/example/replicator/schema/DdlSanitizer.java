@@ -1,4 +1,4 @@
-package com.example.replicator;
+package com.example.replicator.schema;
 
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
@@ -12,12 +12,12 @@ import java.util.Set;
  * Relaxed mode keeps table columns and the primary key, but skips foreign keys,
  * unique constraints, secondary indexes, fulltext/spatial indexes, and checks.
  */
-final class DdlSanitizer {
+public final class DdlSanitizer {
     private DdlSanitizer() {
     }
 
-    static Optional<String> prepare(String sql, String sourceDb, String sinkDb, boolean strictDdl) {
-        String mapped = SchemaMapper.mapDdl(sql, sourceDb, sinkDb);
+    public static Optional<String> prepare(String sql, String sourceDatabaseName, String sinkDatabaseName, boolean strictDdl) {
+        String mapped = SchemaMapper.mapDdl(sql, sourceDatabaseName, sinkDatabaseName);
         if (strictDdl) {
             return Optional.of(mapped);
         }
@@ -189,7 +189,7 @@ final class DdlSanitizer {
         return String.join(" ", typeTokens);
     }
 
-    static String relaxedType(String type) {
+    public static String relaxedType(String type) {
         String normalized = type.toUpperCase(Locale.ROOT);
         if (normalized.startsWith("VARCHAR")
                 || normalized.startsWith("CHAR")

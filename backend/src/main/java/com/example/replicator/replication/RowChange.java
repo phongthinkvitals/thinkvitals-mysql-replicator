@@ -1,15 +1,17 @@
-package com.example.replicator;
+package com.example.replicator.replication;
+
+import com.example.replicator.model.BinlogPosition;
 
 import java.io.Serializable;
 
-record RowChange(
+public record RowChange(
         Kind kind,
         String table,
         Serializable[] before,
         Serializable[] after,
         BinlogPosition position
 ) {
-    enum Kind {
+    public enum Kind {
         INSERT, UPDATE, DELETE
     }
 }
