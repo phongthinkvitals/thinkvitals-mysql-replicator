@@ -167,7 +167,7 @@ class DmlApplier {
             sql += " ON DUPLICATE KEY UPDATE " + update;
         }
         try (PreparedStatement ps = connection.prepareStatement(sql)) {
-            bindValues(ps, values, metadata.columns().size(), 1);
+            bindValues(ps, metadata, values, 1);
             ps.executeUpdate();
         }
     }
@@ -183,9 +183,9 @@ class DmlApplier {
         String sql = "UPDATE " + SqlNames.qualified(sinkDb, metadata.table()) + " SET " + set + " WHERE " + where;
         try (PreparedStatement ps = connection.prepareStatement(sql)) {
             int index = 1;
-            for (int i = 0; i < metadata.columns().size(); i++) {
-                if (!metadata.primaryKeys().contains(metadata.columns().get(i))) {
-                    ps.setObject(index++, normalize(after[i]));
+            for (String column : metadata.columns()) {
+                if (!metadata.primaryKeys().contains(column)) {
+                    ps.setObject(index++, normalize(after[metadata.sourceIndex(column)]));
                 }
             }
             bindPrimaryKeys(ps, metadata, before, index);
@@ -219,14 +219,15 @@ class DmlApplier {
     private void bindPrimaryKeys(PreparedStatement ps, TableMetadata metadata, Object[] values, int startIndex) throws Exception {
         int index = startIndex;
         for (String pk : metadata.primaryKeys()) {
-            int columnIndex = metadata.columns().indexOf(pk);
+            int columnIndex = metadata.sourceIndex(pk);
             ps.setObject(index++, normalize(values[columnIndex]));
         }
     }
 
-    private void bindValues(PreparedStatement ps, Object[] values, int count, int startIndex) throws Exception {
-        for (int i = 0; i < count; i++) {
-            ps.setObject(startIndex + i, normalize(values[i]));
+    private void bindValues(PreparedStatement ps, TableMetadata metadata, Object[] values, int startIndex) throws Exception {
+        int index = startIndex;
+        for (String column : metadata.columns()) {
+            ps.setObject(index++, normalize(values[metadata.sourceIndex(column)]));
         }
     }
 

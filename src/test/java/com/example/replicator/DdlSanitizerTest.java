@@ -55,6 +55,18 @@ class DdlSanitizerTest {
     }
 
     @Test
+    void relaxedCreateTableKeepsInlinePrimaryKeyColumn() {
+        String ddl = "CREATE TABLE `test` (id INT(11) UNSIGNED NOT NULL PRIMARY KEY AUTO_INCREMENT)";
+
+        String relaxed = DdlSanitizer.prepare(ddl, "source_db", "sink_db", false).orElseThrow();
+
+        assertThat(relaxed).contains("`id` INT(11) UNSIGNED");
+        assertThat(relaxed).doesNotContain("AUTO_INCREMENT");
+        assertThat(relaxed).doesNotContain("NOT NULL");
+        assertThat(relaxed).doesNotContain("CREATE TABLE `test` (\n  \n)");
+    }
+
+    @Test
     void strictModeKeepsDdlUnchangedExceptSchemaMapping() {
         String ddl = "CREATE TABLE `source_db`.`user_model` (`id` int PRIMARY KEY, UNIQUE KEY `uk_id` (`id`))";
 

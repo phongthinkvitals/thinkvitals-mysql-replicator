@@ -18,3 +18,5 @@
 /Users/phong/mysql-binlog-replicator/src/main/java/com/example/replicator/SqlNames.java
 /Users/phong/mysql-binlog-replicator/src/main/java/com/example/replicator/TableFilter.java
 /Users/phong/mysql-binlog-replicator/src/main/java/com/example/replicator/TableMetadata.java
+/Users/phong/mysql-binlog-replicator/src/main/java/com/example/replicator/TableVerificationStatus.java
+/Users/phong/mysql-binlog-replicator/src/main/java/com/example/replicator/VerificationService.java

@@ -49,6 +49,18 @@ curl http://localhost:8080/health
 curl http://localhost:8080/replication/status
 ```
 
+Verify one table with row count and checksum:
+
+```bash
+curl "http://localhost:8080/replication/verify?table=user_model"
+```
+
+For a large table, verify only the first N rows ordered by primary key:
+
+```bash
+curl "http://localhost:8080/replication/verify?table=user_model&limit=10000"
+```
+
 Pause/resume:
 
 ```bash
@@ -125,6 +137,22 @@ Important columns:
 - `last_error`: last snapshot/apply error captured for that table.
 
 This table is metadata only. Resume still uses `replication_checkpoint` as the single ordered checkpoint so binlog ordering stays global.
+
+## Verification API
+
+`GET /replication/verify?table=<table_name>` compares one source table with the matching sink table.
+
+Response fields:
+
+- `matched`: `true` when source/sink row count and checksums match.
+- `sourceRows`, `sinkRows`: row count used for the verification.
+- `sourceChecksum`, `sinkChecksum`: `BIT_XOR(CRC32(...))` aggregate over replicated writable columns.
+- `sourceSum`, `sinkSum`: secondary `SUM(CRC32(...))` aggregate to reduce collision risk.
+- `columns`: columns included in the hash. Generated columns skipped by relaxed DDL are not included.
+- `primaryKeys`: primary key columns used for deterministic limited verification.
+- `limit`: present when the request only checks the first N rows ordered by primary key.
+
+Full verification scans the entire table on both databases. Use `limit` for a quick health check on very large tables, but treat it as a sample, not full proof. Tables without a primary key return `comparable=false` because deterministic ordering for limited verification is not available.
 
 ## Current Defaults
 

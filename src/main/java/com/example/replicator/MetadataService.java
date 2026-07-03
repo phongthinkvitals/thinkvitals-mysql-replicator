@@ -101,6 +101,13 @@ class MetadataService {
     }
 
     private TableMetadata load(String table) {
+        List<String> sourceColumns = source.query("""
+                        SELECT COLUMN_NAME
+                        FROM INFORMATION_SCHEMA.COLUMNS
+                        WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+                        ORDER BY ORDINAL_POSITION
+                        """,
+                (rs, rowNum) -> rs.getString(1), sourceDb, table);
         List<String> columns = source.query("""
                         SELECT COLUMN_NAME
                         FROM INFORMATION_SCHEMA.COLUMNS
@@ -116,6 +123,6 @@ class MetadataService {
                         ORDER BY ORDINAL_POSITION
                         """,
                 (rs, rowNum) -> rs.getString(1), sourceDb, table));
-        return new TableMetadata(table, columns, primaryKeys);
+        return new TableMetadata(table, columns, primaryKeys, sourceColumns);
     }
 }

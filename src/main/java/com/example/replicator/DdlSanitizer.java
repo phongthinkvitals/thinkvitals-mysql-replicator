@@ -64,7 +64,7 @@ final class DdlSanitizer {
 
     private static boolean shouldKeepCreateTableDefinition(String definition) {
         String normalized = definition.stripLeading().toUpperCase(Locale.ROOT);
-        return normalized.startsWith("`") || normalized.startsWith("PRIMARY KEY");
+        return normalized.startsWith("PRIMARY KEY") || !isTableConstraintOrIndexDefinition(normalized);
     }
 
     private static String relaxCreateTableDefinition(String definition, Set<String> primaryKeyColumns) {
@@ -76,18 +76,18 @@ final class DdlSanitizer {
         if (isGeneratedColumn(normalized)) {
             return "";
         }
-        int closingBacktick = stripped.indexOf('`', 1);
-        if (!stripped.startsWith("`") || closingBacktick < 0) {
+        ColumnDefinition columnDefinition = parseColumnDefinition(stripped);
+        if (columnDefinition == null) {
             return stripped;
         }
-        String column = stripped.substring(0, closingBacktick + 1);
-        String columnName = stripped.substring(1, closingBacktick).replace("``", "`");
-        String typeAndOptions = stripped.substring(closingBacktick + 1).stripLeading();
-        String type = typeOnly(typeAndOptions);
-        if (!primaryKeyColumns.contains(columnName)) {
+        String type = typeOnly(columnDefinition.typeAndOptions());
+        if (!primaryKeyColumns.contains(columnDefinition.name())) {
             type = relaxedType(type);
         }
-        return column + " " + type;
+        if (type.isBlank()) {
+            return "";
+        }
+        return quoteIdentifier(columnDefinition.name()) + " " + type;
     }
 
     private static Set<String> primaryKeyColumns(List<String> definitions) {
@@ -120,6 +120,61 @@ final class DdlSanitizer {
                 || normalized.contains(" AS (")
                 || normalized.endsWith(" STORED")
                 || normalized.endsWith(" VIRTUAL");
+    }
+
+    private static boolean isTableConstraintOrIndexDefinition(String normalized) {
+        return normalized.startsWith("CONSTRAINT ")
+                || normalized.startsWith("UNIQUE ")
+                || normalized.startsWith("UNIQUE KEY ")
+                || normalized.startsWith("UNIQUE INDEX ")
+                || normalized.startsWith("KEY ")
+                || normalized.startsWith("INDEX ")
+                || normalized.startsWith("FULLTEXT ")
+                || normalized.startsWith("FULLTEXT KEY ")
+                || normalized.startsWith("FULLTEXT INDEX ")
+                || normalized.startsWith("SPATIAL ")
+                || normalized.startsWith("SPATIAL KEY ")
+                || normalized.startsWith("SPATIAL INDEX ")
+                || normalized.startsWith("FOREIGN KEY ")
+                || normalized.startsWith("CHECK ");
+    }
+
+    private static ColumnDefinition parseColumnDefinition(String stripped) {
+        if (stripped.startsWith("`")) {
+            int closingBacktick = stripped.indexOf('`', 1);
+            if (closingBacktick < 0) {
+                return null;
+            }
+            String name = stripped.substring(1, closingBacktick).replace("``", "`");
+            return new ColumnDefinition(name, stripped.substring(closingBacktick + 1).stripLeading());
+        }
+
+        int end = firstWhitespace(stripped);
+        if (end <= 0) {
+            return null;
+        }
+        String name = stripped.substring(0, end);
+        return new ColumnDefinition(unquoteIdentifier(name), stripped.substring(end).stripLeading());
+    }
+
+    private static int firstWhitespace(String value) {
+        for (int i = 0; i < value.length(); i++) {
+            if (Character.isWhitespace(value.charAt(i))) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private static String quoteIdentifier(String value) {
+        return "`" + value.replace("`", "``") + "`";
+    }
+
+    private static String unquoteIdentifier(String value) {
+        if (value.startsWith("`") && value.endsWith("`") && value.length() >= 2) {
+            return value.substring(1, value.length() - 1).replace("``", "`");
+        }
+        return value;
     }
 
     private static String typeOnly(String definition) {
@@ -301,5 +356,8 @@ final class DdlSanitizer {
             parts.add(value.substring(start));
         }
         return parts;
+    }
+
+    private record ColumnDefinition(String name, String typeAndOptions) {
     }
 }
