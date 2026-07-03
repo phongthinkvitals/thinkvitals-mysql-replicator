@@ -5,6 +5,7 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.security.Principal;
 import java.util.Map;
 
 @RestController
@@ -21,6 +22,11 @@ public class MonitoringController {
     @GetMapping("/health")
     Map<String, String> health() {
         return Map.of("status", "UP");
+    }
+
+    @GetMapping("/auth/me")
+    Map<String, String> me(Principal principal) {
+        return Map.of("username", principal.getName());
     }
 
     @GetMapping("/replication/status")

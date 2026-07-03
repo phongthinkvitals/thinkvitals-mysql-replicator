@@ -15,11 +15,16 @@ docker compose up --build
 
 Open the UI at http://localhost:5173.
 
+Default login:
+
+- Username: `admin`
+- Password: `admin123`
+
 Backend API:
 
 ```bash
 curl http://localhost:8080/health
-curl http://localhost:8080/replication/status
+curl -u admin:admin123 http://localhost:8080/replication/status
 ```
 
 If you need fresh MySQL volumes:
@@ -46,7 +51,7 @@ npm install
 npm run dev
 ```
 
-The frontend dev server proxies `/health` and `/replication/*` to `http://localhost:8080`.
+The frontend dev server proxies `/health`, `/auth/*`, and `/replication/*` to `http://localhost:8080`.
 
 ## Backend Docs
 

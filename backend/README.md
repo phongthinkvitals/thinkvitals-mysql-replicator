@@ -54,26 +54,26 @@ Health:
 
 ```bash
 curl http://localhost:8080/health
-curl http://localhost:8080/replication/status
+curl -u admin:admin123 http://localhost:8080/replication/status
 ```
 
 Verify one table with row count and checksum:
 
 ```bash
-curl "http://localhost:8080/replication/verify?table=user_model"
+curl -u admin:admin123 "http://localhost:8080/replication/verify?table=user_model"
 ```
 
 For a large table, verify only the first N rows ordered by primary key:
 
 ```bash
-curl "http://localhost:8080/replication/verify?table=user_model&limit=10000"
+curl -u admin:admin123 "http://localhost:8080/replication/verify?table=user_model&limit=10000"
 ```
 
 Pause/resume:
 
 ```bash
-curl -X POST http://localhost:8080/replication/pause
-curl -X POST http://localhost:8080/replication/resume
+curl -u admin:admin123 -X POST http://localhost:8080/replication/pause
+curl -u admin:admin123 -X POST http://localhost:8080/replication/resume
 ```
 
 ## Configuration
@@ -93,6 +93,7 @@ sink:
 
 replication:
   serverId: 987654
+  autoStart: false
   useGtid: true
   snapshotMode: initial
   ddlEnabled: true
@@ -163,5 +164,7 @@ Response fields:
 Full verification scans the entire table on both databases. Use `limit` for a quick health check on very large tables, but treat it as a sample, not full proof. Tables without a primary key return `comparable=false` because deterministic ordering for limited verification is not available.
 
 ## Current Defaults
+
+Replication waits for an authorized run command by default with `replication.autoStart=false`. Set it to `true` only if the backend should start syncing immediately on boot.
 
 `UPDATE` and `DELETE` require primary keys by default. Tables without primary keys are rejected for those operations to avoid ambiguous writes. `INSERT` defaults to `ON DUPLICATE KEY UPDATE` and can be changed with `replication.onDuplicateInsert=strict`. Sink DDL defaults to relaxed mode with `replication.strictDdl=false`.

@@ -144,6 +144,45 @@ h2 {
   margin-bottom: 18px;
 }
 
+.session-bar {
+  align-items: center;
+  background: #ffffff;
+  border: 1px solid #dce3e6;
+  border-radius: 8px;
+  display: flex;
+  gap: 16px;
+  justify-content: space-between;
+  margin-bottom: 14px;
+  padding: 12px 14px;
+}
+
+.session-bar span {
+  color: #62717a;
+  display: block;
+  font-size: 0.82rem;
+  margin-bottom: 2px;
+}
+
+.session-bar strong {
+  display: block;
+}
+
+.login-layout {
+  display: grid;
+  min-height: 54vh;
+  place-items: center;
+}
+
+.login-panel {
+  max-width: 430px;
+  width: 100%;
+}
+
+.login-form {
+  display: grid;
+  gap: 14px;
+}
+
 .stats-grid,
 .content-grid {
   display: grid;
@@ -307,6 +346,11 @@ input:focus {
 
   .topbar {
     align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .session-bar {
+    align-items: stretch;
     flex-direction: column;
   }
 

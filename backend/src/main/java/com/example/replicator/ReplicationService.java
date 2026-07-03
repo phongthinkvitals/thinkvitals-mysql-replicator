@@ -62,7 +62,13 @@ public class ReplicationService implements ApplicationRunner {
 
     @Override
     public void run(ApplicationArguments args) {
-        resume();
+        if (checkpointService.properties().getReplication().isAutoStart()) {
+            resume();
+            return;
+        }
+        paused.set(true);
+        checkpointService.refreshStatus(false, true, null);
+        log.info("Replication is waiting for an authorized run command");
     }
 
     public synchronized void pause() {

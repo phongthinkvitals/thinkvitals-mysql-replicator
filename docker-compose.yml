@@ -31,7 +31,7 @@ services:
       - --binlog-row-image=FULL
     environment:
       MYSQL_ROOT_PASSWORD: password
-      MYSQL_DATABASE: thinkvitals_bcp
+      MYSQL_DATABASE: thinkvitals
     volumes:
       - replicator-sink:/var/lib/mysql
     ports:
@@ -42,31 +42,33 @@ services:
       timeout: 3s
       retries: 30
 
-  replicator:
-    build:
-      context: ./backend
-    depends_on:
-      source-mysql:
-        condition: service_healthy
-      sink-mysql:
-        condition: service_healthy
-    environment:
-      SOURCE_URL: jdbc:mysql://source-mysql:3306/thinkvitals?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
-      SOURCE_USERNAME: root
-      SOURCE_PASSWORD: password
-      SINK_URL: jdbc:mysql://sink-mysql:3306/thinkvitals_bcp?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
-      SINK_USERNAME: root
-      SINK_PASSWORD: password
-    ports:
-      - "8080:8080"
+  # replicator:
+  #   build:
+  #     context: ./backend
+  #   depends_on:
+  #     source-mysql:
+  #       condition: service_healthy
+  #     sink-mysql:
+  #       condition: service_healthy
+  #   environment:
+  #     SOURCE_URL: jdbc:mysql://source-mysql:3306/thinkvitals?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+  #     SOURCE_USERNAME: root
+  #     SOURCE_PASSWORD: password
+  #     SINK_URL: jdbc:mysql://sink-mysql:3306/thinkvitals?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+  #     SINK_USERNAME: root
+  #     SINK_PASSWORD: password
+  #     APP_USERNAME: admin
+  #     APP_PASSWORD: admin123
+  #   ports:
+  #     - "8080:8080"
 
-  frontend:
-    build:
-      context: ./frontend
-    depends_on:
-      - replicator
-    ports:
-      - "5173:80"
+  # frontend:
+  #   build:
+  #     context: ./frontend
+  #   depends_on:
+  #     - replicator
+  #   ports:
+  #     - "5173:80"
 
 volumes:
   replicator-source:

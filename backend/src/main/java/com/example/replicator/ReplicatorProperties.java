@@ -85,6 +85,7 @@ public class ReplicatorProperties {
 
     public static class Replication {
         private long serverId = 987654L;
+        private boolean autoStart = false;
         private boolean useGtid = true;
         private String snapshotMode = "initial";
         private boolean ddlEnabled = true;
@@ -101,6 +102,14 @@ public class ReplicatorProperties {
 
         public void setServerId(long serverId) {
             this.serverId = serverId;
+        }
+
+        public boolean isAutoStart() {
+            return autoStart;
+        }
+
+        public void setAutoStart(boolean autoStart) {
+            this.autoStart = autoStart;
         }
 
         public boolean isUseGtid() {
