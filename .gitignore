@@ -1,4 +1,8 @@
 
 .idea/
 
-target/classes/META-INF/spring-configuration-metadata.json
+target/
+backend/target/
+backend/target/classes/META-INF/spring-configuration-metadata.json
+frontend/node_modules/
+frontend/dist/

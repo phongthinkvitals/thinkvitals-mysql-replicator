@@ -13,10 +13,11 @@ services:
       MYSQL_DATABASE: thinkvitals
     volumes:
       - replicator-source:/var/lib/mysql
+      - ./backend/docker/mysql/source:/docker-entrypoint-initdb.d:ro
     ports:
       - "3309:3306"
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-proot"]
+      test: ["CMD", "mysqladmin", "ping", "-ppassword"]
       interval: 5s
       timeout: 3s
       retries: 30
@@ -30,33 +31,42 @@ services:
       - --binlog-row-image=FULL
     environment:
       MYSQL_ROOT_PASSWORD: password
-      MYSQL_DATABASE: thinkvitals
+      MYSQL_DATABASE: thinkvitals_bcp
     volumes:
       - replicator-sink:/var/lib/mysql
     ports:
       - "3310:3306"
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-proot"]
+      test: ["CMD", "mysqladmin", "ping", "-ppassword"]
       interval: 5s
       timeout: 3s
       retries: 30
 
   replicator:
-    build: .
+    build:
+      context: ./backend
     depends_on:
       source-mysql:
         condition: service_healthy
       sink-mysql:
         condition: service_healthy
     environment:
-      SOURCE_URL: jdbc:mysql://source-mysql:3309/thinkvitals?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+      SOURCE_URL: jdbc:mysql://source-mysql:3306/thinkvitals?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
       SOURCE_USERNAME: root
       SOURCE_PASSWORD: password
-      SINK_URL: jdbc:mysql://sink-mysql:3310/thinkvitals?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+      SINK_URL: jdbc:mysql://sink-mysql:3306/thinkvitals_bcp?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
       SINK_USERNAME: root
       SINK_PASSWORD: password
     ports:
       - "8080:8080"
+
+  frontend:
+    build:
+      context: ./frontend
+    depends_on:
+      - replicator
+    ports:
+      - "5173:80"
 
 volumes:
   replicator-source:
