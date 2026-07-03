@@ -40,6 +40,11 @@ public class MonitoringController {
         return verificationService.verifyTable(table, limit);
     }
 
+    @GetMapping("/replication/verify/all")
+    ReplicationVerificationSummary verifyAll(@RequestParam(required = false) Integer limit) {
+        return verificationService.verifyAll(limit);
+    }
+
     @PostMapping("/replication/pause")
     Map<String, String> pause() {
         replicationService.pause();

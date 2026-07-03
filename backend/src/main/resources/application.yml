@@ -19,7 +19,7 @@ replication:
   ddlEnabled: true
   # false = relaxed sink DDL: keep columns and primary key, skip FK/unique/index/check constraints.
   # true = strict sink DDL: apply source DDL as-is after source/sink schema mapping.
-  strictDdl: false
+  strictDdl: true
   dmlEnabled: true
   includeTables: []
   excludeTables:

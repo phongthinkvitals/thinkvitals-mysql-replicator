@@ -14,7 +14,9 @@
     "lucide-react": "latest"
   },
   "devDependencies": {
+    "@tailwindcss/vite": "latest",
     "@vitejs/plugin-react": "latest",
+    "tailwindcss": "latest",
     "vite": "latest"
   }
 }

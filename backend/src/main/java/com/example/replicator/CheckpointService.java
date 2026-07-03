@@ -207,6 +207,32 @@ public class CheckpointService {
                 sourceEndpoint.database(), sinkEndpoint.database(), table, error);
     }
 
+    void markIntegrityVerified(String table) {
+        sink.update("""
+                        INSERT INTO replication_table_sync_metadata (
+                            source_database, sink_database, table_name, last_applied_time, last_error
+                        ) VALUES (?, ?, ?, CURRENT_TIMESTAMP(3), NULL)
+                        ON DUPLICATE KEY UPDATE
+                            sink_database = VALUES(sink_database),
+                            last_applied_time = VALUES(last_applied_time),
+                            last_error = VALUES(last_error)
+                        """,
+                sourceEndpoint.database(), sinkEndpoint.database(), table);
+    }
+
+    void markIntegrityFailure(String table, String error) {
+        sink.update("""
+                        INSERT INTO replication_table_sync_metadata (
+                            source_database, sink_database, table_name, last_applied_time, last_error
+                        ) VALUES (?, ?, ?, CURRENT_TIMESTAMP(3), ?)
+                        ON DUPLICATE KEY UPDATE
+                            sink_database = VALUES(sink_database),
+                            last_applied_time = VALUES(last_applied_time),
+                            last_error = VALUES(last_error)
+                        """,
+                sourceEndpoint.database(), sinkEndpoint.database(), table, error);
+    }
+
     void saveTableEventsWithConnection(Connection connection, Collection<String> tables, BinlogPosition position) throws Exception {
         Set<String> uniqueTables = new LinkedHashSet<>(tables);
         uniqueTables.removeIf(table -> table == null || table.isBlank());

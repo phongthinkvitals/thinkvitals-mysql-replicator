@@ -63,10 +63,17 @@ Verify one table with row count and checksum:
 curl -u admin:admin123 "http://localhost:8080/replication/verify?table=user_model"
 ```
 
+Verify every replicated table:
+
+```bash
+curl -u admin:admin123 "http://localhost:8080/replication/verify/all"
+```
+
 For a large table, verify only the first N rows ordered by primary key:
 
 ```bash
 curl -u admin:admin123 "http://localhost:8080/replication/verify?table=user_model&limit=10000"
+curl -u admin:admin123 "http://localhost:8080/replication/verify/all?limit=10000"
 ```
 
 Pause/resume:
@@ -150,6 +157,8 @@ This table is metadata only. Resume still uses `replication_checkpoint` as the s
 ## Verification API
 
 `GET /replication/verify?table=<table_name>` compares one source table with the matching sink table.
+
+`GET /replication/verify/all` compares all included replicated tables and returns a summary plus per-table results. Mismatches and verification failures are written to `replication_table_sync_metadata.last_error` so integrity problems are visible after the API call.
 
 Response fields:
 

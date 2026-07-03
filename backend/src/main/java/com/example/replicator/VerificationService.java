@@ -5,6 +5,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -17,6 +18,7 @@ class VerificationService {
     private final JdbcTemplate source;
     private final JdbcTemplate sink;
     private final MetadataService metadataService;
+    private final CheckpointService checkpointService;
     private final TableFilter tableFilter;
     private final String sourceDb;
     private final String sinkDb;
@@ -28,9 +30,51 @@ class VerificationService {
         this.source = source;
         this.sink = sink;
         this.metadataService = metadataService;
+        this.checkpointService = checkpointService;
         this.tableFilter = new TableFilter(checkpointService.properties().getReplication());
         this.sourceDb = checkpointService.sourceEndpoint().database();
         this.sinkDb = checkpointService.sinkEndpoint().database();
+    }
+
+    ReplicationVerificationSummary verifyAll(Integer limit) {
+        Integer normalizedLimit = limit != null && limit > 0 ? limit : null;
+        List<String> tables = source.query("""
+                        SELECT TABLE_NAME
+                        FROM INFORMATION_SCHEMA.TABLES
+                        WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE'
+                        ORDER BY TABLE_NAME
+                        """,
+                (rs, rowNum) -> rs.getString(1), sourceDb);
+        List<TableVerificationStatus> results = new ArrayList<>();
+        for (String table : tables) {
+            if (!tableFilter.accepts(table)) {
+                continue;
+            }
+            try {
+                results.add(verifyTable(table, normalizedLimit));
+            } catch (Exception e) {
+                TableVerificationStatus failed = new TableVerificationStatus(table, false, false,
+                        0, 0, null, null, null, null, List.of(), List.of(), normalizedLimit,
+                        "Verification failed: " + e.getMessage(), Instant.now());
+                checkpointService.markIntegrityFailure(table, failed.note());
+                results.add(failed);
+            }
+        }
+        int matchedTables = 0;
+        int mismatchedTables = 0;
+        int notComparableTables = 0;
+        for (TableVerificationStatus result : results) {
+            if (!result.comparable()) {
+                notComparableTables++;
+            } else if (result.matched()) {
+                matchedTables++;
+            } else {
+                mismatchedTables++;
+            }
+        }
+        boolean matched = mismatchedTables == 0 && notComparableTables == 0;
+        return new ReplicationVerificationSummary(matched, results.size(), matchedTables, mismatchedTables,
+                notComparableTables, normalizedLimit, results, Instant.now());
     }
 
     TableVerificationStatus verifyTable(String table, Integer limit) {
@@ -38,14 +82,18 @@ class VerificationService {
         Integer normalizedLimit = limit != null && limit > 0 ? limit : null;
         TableMetadata metadata = metadataService.table(table);
         if (!metadata.hasPrimaryKey()) {
-            return new TableVerificationStatus(table, false, false, 0, 0, null, null, null, null,
+            TableVerificationStatus result = new TableVerificationStatus(table, false, false, 0, 0, null, null, null, null,
                     metadata.columns(), List.copyOf(metadata.primaryKeys()), normalizedLimit,
                     "Table has no primary key, deterministic checksum ordering is not available", Instant.now());
+            checkpointService.markIntegrityFailure(table, result.note());
+            return result;
         }
         if (metadata.columns().isEmpty()) {
-            return new TableVerificationStatus(table, false, false, 0, 0, null, null, null, null,
+            TableVerificationStatus result = new TableVerificationStatus(table, false, false, 0, 0, null, null, null, null,
                     metadata.columns(), List.copyOf(metadata.primaryKeys()), normalizedLimit,
                     "Table has no writable columns to verify", Instant.now());
+            checkpointService.markIntegrityFailure(table, result.note());
+            return result;
         }
 
         HashResult sourceHash = hash(source, sourceDb, table, metadata, normalizedLimit);
@@ -56,11 +104,26 @@ class VerificationService {
         String note = normalizedLimit == null
                 ? "Full table checksum over replicated writable columns"
                 : "Limited checksum over first " + normalizedLimit + " rows ordered by primary key";
-        return new TableVerificationStatus(table, true, matched,
+        TableVerificationStatus result = new TableVerificationStatus(table, true, matched,
                 sourceHash.rows(), sinkHash.rows(),
                 sourceHash.xorChecksum(), sinkHash.xorChecksum(),
                 sourceHash.sumChecksum(), sinkHash.sumChecksum(),
                 metadata.columns(), List.copyOf(metadata.primaryKeys()), normalizedLimit, note, Instant.now());
+        if (matched) {
+            checkpointService.markIntegrityVerified(table);
+        } else {
+            checkpointService.markIntegrityFailure(table, mismatchNote(result));
+        }
+        return result;
+    }
+
+    private String mismatchNote(TableVerificationStatus result) {
+        return "Verification mismatch rows source=" + result.sourceRows()
+                + " sink=" + result.sinkRows()
+                + " checksum source=" + result.sourceChecksum()
+                + " sink=" + result.sinkChecksum()
+                + " sum source=" + result.sourceSum()
+                + " sink=" + result.sinkSum();
     }
 
     private void validateTable(String table) {
