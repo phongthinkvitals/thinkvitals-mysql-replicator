@@ -126,12 +126,15 @@ public class ReplicationService implements ApplicationRunner {
                 checkpointService.properties().getSource().getPassword());
         binaryLogClient.setServerId(checkpointService.properties().getReplication().getServerId());
         if (checkpoint != null) {
-            if (checkpointService.properties().getReplication().isUseGtid()
-                    && checkpoint.gtidSet() != null && !checkpoint.gtidSet().isBlank()) {
-                binaryLogClient.setGtidSet(checkpoint.gtidSet());
-            } else if (checkpoint.binlogFile() != null && checkpoint.binlogPosition() != null) {
+            if (checkpoint.binlogFile() != null && checkpoint.binlogPosition() != null) {
                 binaryLogClient.setBinlogFilename(checkpoint.binlogFile());
                 binaryLogClient.setBinlogPosition(checkpoint.binlogPosition());
+                log.info("Starting binlog client from checkpoint file={} position={}",
+                        checkpoint.binlogFile(), checkpoint.binlogPosition());
+            } else if (checkpointService.properties().getReplication().isUseGtid()
+                    && checkpoint.gtidSet() != null && !checkpoint.gtidSet().isBlank()) {
+                binaryLogClient.setGtidSet(checkpoint.gtidSet());
+                log.info("Starting binlog client from checkpoint GTID set={}", checkpoint.gtidSet());
             }
         }
         BinlogEventHandler handler = new BinlogEventHandler(binaryLogClient);

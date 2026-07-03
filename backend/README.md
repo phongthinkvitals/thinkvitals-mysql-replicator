@@ -87,7 +87,7 @@ source:
   password: password
 
 sink:
-  url: jdbc:mysql://localhost:3310/thinkvitals_bcp?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+  url: jdbc:mysql://localhost:3310/thinkvitals?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
   username: root
   password: password
 

@@ -3,6 +3,8 @@ package com.example.replicator;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.sql.Timestamp;
 import java.sql.Connection;
@@ -19,6 +21,8 @@ import java.util.concurrent.atomic.AtomicReference;
 
 @Service
 public class CheckpointService {
+    private static final Logger log = LoggerFactory.getLogger(CheckpointService.class);
+
     private final JdbcTemplate sink;
     private final ReplicatorProperties properties;
     private final JdbcUrlParser.MysqlEndpoint sourceEndpoint;
@@ -32,7 +36,7 @@ public class CheckpointService {
         this.sinkEndpoint = JdbcUrlParser.parse(properties.getSink().getUrl(), properties.getSink().getDatabase());
         ensureTable();
         status.set(new ReplicationStatus(false, false, sourceEndpoint.database(), sinkEndpoint.database(),
-                null, null, null, null, null, null, null, null, null));
+                null, null, null, null, null, null, null, null, false, null, null));
     }
 
     void ensureTable() {
@@ -76,8 +80,9 @@ public class CheckpointService {
 
     Optional<BinlogPosition> load() {
         List<BinlogPosition> rows = sink.query("""
-                        SELECT binlog_file, binlog_position, gtid_set, last_event_type, last_table_name, last_event_time
-                        FROM replication_checkpoint WHERE id = 1 AND source_database = ?
+                        SELECT source_database, binlog_file, binlog_position, gtid_set,
+                               last_event_type, last_table_name, last_event_time
+                        FROM replication_checkpoint WHERE id = 1
                         """,
                 (rs, rowNum) -> new BinlogPosition(
                         rs.getString("binlog_file"),
@@ -85,10 +90,18 @@ public class CheckpointService {
                         rs.getString("gtid_set"),
                         rs.getString("last_event_type"),
                         rs.getString("last_table_name"),
-                        rs.getTimestamp("last_event_time") == null ? null : rs.getTimestamp("last_event_time").toLocalDateTime()
-                ),
-                sourceEndpoint.database());
-        return rows.stream().findFirst();
+                        rs.getTimestamp("last_event_time") == null ? null : rs.getTimestamp("last_event_time").toLocalDateTime(),
+                        rs.getString("source_database")
+                ));
+        Optional<BinlogPosition> checkpoint = rows.stream().findFirst();
+        checkpoint.ifPresent(position -> {
+            if (position.sourceDatabase() != null
+                    && !position.sourceDatabase().equalsIgnoreCase(sourceEndpoint.database())) {
+                log.warn("Checkpoint source_database={} differs from configured source database={}; resuming from id=1 checkpoint because this app has a single checkpoint stream",
+                        position.sourceDatabase(), sourceEndpoint.database());
+            }
+        });
+        return checkpoint;
     }
 
     void save(BinlogPosition position) {
@@ -98,6 +111,7 @@ public class CheckpointService {
                             last_event_type, last_table_name, last_event_time, last_applied_time
                         ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP(3))
                         ON DUPLICATE KEY UPDATE
+                            source_database = VALUES(source_database),
                             binlog_file = VALUES(binlog_file),
                             binlog_position = VALUES(binlog_position),
                             gtid_set = VALUES(gtid_set),
@@ -123,6 +137,7 @@ public class CheckpointService {
                     last_event_type, last_table_name, last_event_time, last_applied_time
                 ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP(3))
                 ON DUPLICATE KEY UPDATE
+                    source_database = VALUES(source_database),
                     binlog_file = VALUES(binlog_file),
                     binlog_position = VALUES(binlog_position),
                     gtid_set = VALUES(gtid_set),
@@ -269,16 +284,15 @@ public class CheckpointService {
     void refreshStatus(boolean running, boolean paused, String error) {
         Optional<BinlogPosition> cp = load();
         LocalDateTime applied = sink.query("""
-                        SELECT last_applied_time FROM replication_checkpoint WHERE id = 1 AND source_database = ?
+                        SELECT last_applied_time FROM replication_checkpoint WHERE id = 1
                         """,
-                rs -> rs.next() ? rs.getTimestamp("last_applied_time").toLocalDateTime() : null,
-                sourceEndpoint.database());
-        BinlogPosition p = cp.orElse(new BinlogPosition(null, null, null, null, null, null));
+                rs -> rs.next() ? rs.getTimestamp("last_applied_time").toLocalDateTime() : null);
+        BinlogPosition p = cp.orElse(new BinlogPosition(null, null, null, null, null, null, null));
         Long lagMs = p.lastEventTime() == null ? null : Instant.now().toEpochMilli()
                 - p.lastEventTime().atZone(ZoneId.systemDefault()).toInstant().toEpochMilli();
         status.set(new ReplicationStatus(running, paused, sourceEndpoint.database(), sinkEndpoint.database(),
                 p.binlogFile(), p.binlogPosition(), p.gtidSet(), p.lastTableName(), p.lastEventType(),
-                p.lastEventTime(), applied, lagMs, error));
+                p.lastEventTime(), applied, lagMs, cp.isPresent(), p.sourceDatabase(), error));
     }
 
     ReplicationStatus status() {

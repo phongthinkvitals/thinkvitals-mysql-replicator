@@ -15,6 +15,8 @@ public record ReplicationStatus(
         LocalDateTime lastEventTime,
         LocalDateTime lastAppliedTime,
         Long lagMs,
+        boolean checkpointPresent,
+        String checkpointSourceDatabase,
         String error
 ) {
 }

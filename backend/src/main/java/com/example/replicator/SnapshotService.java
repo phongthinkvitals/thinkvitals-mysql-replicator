@@ -52,11 +52,16 @@ public class SnapshotService {
     }
 
     BinlogPosition runIfNeeded() throws Exception {
-        if (checkpointService.load().isPresent()
+        var checkpoint = checkpointService.load();
+        if (checkpoint.isPresent()
                 || !"initial".equalsIgnoreCase(checkpointService.properties().getReplication().getSnapshotMode())) {
-            return checkpointService.load().orElse(null);
+            checkpoint.ifPresent(position -> log.info("Resuming replication from checkpoint binlog={}:{} gtid={} lastEventType={} table={}",
+                    position.binlogFile(), position.binlogPosition(), position.gtidSet(),
+                    position.lastEventType(), position.lastTableName()));
+            return checkpoint.orElse(null);
         }
 
+        log.info("No checkpoint found for source database {}; running initial snapshot", sourceDb);
         try (Connection lockConnection = sourceDataSource.getConnection()) {
             boolean locked = tryReadLock(lockConnection);
             if (!locked) {

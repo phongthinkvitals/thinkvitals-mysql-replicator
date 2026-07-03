@@ -329,9 +329,13 @@ function App() {
             />
             <StatCard
               icon={ShieldCheck}
-              label="Last Event"
-              value={status?.lastEventType ?? 'None'}
-              detail={status?.lastTableName ?? 'No table yet'}
+              label="Checkpoint"
+              value={status?.checkpointPresent ? 'Found' : 'Missing'}
+              detail={
+                status?.checkpointSourceDatabase
+                  ? `Source ${status.checkpointSourceDatabase}`
+                  : 'No checkpoint row'
+              }
             />
           </section>
 
