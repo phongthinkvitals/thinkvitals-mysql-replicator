@@ -16,50 +16,50 @@ public final class DdlSanitizer {
     private DdlSanitizer() {
     }
 
-    public static Optional<String> prepare(String sql, String sourceDatabaseName, String sinkDatabaseName, boolean strictDdl) {
-        String mapped = SchemaMapper.mapDdl(sql, sourceDatabaseName, sinkDatabaseName);
+    public static Optional<String> prepare(String sourceDdlSql, String sourceDatabaseName, String sinkDatabaseName, boolean strictDdl) {
+        String mappedSinkDdlSql = SchemaMapper.mapDdl(sourceDdlSql, sourceDatabaseName, sinkDatabaseName);
         if (strictDdl) {
-            return Optional.of(mapped);
+            return Optional.of(mappedSinkDdlSql);
         }
 
-        String normalized = sql.trim().toUpperCase(Locale.ROOT);
-        if (normalized.startsWith("CREATE TABLE")) {
-            return Optional.of(relaxCreateTable(mapped));
+        String normalizedSourceDdlSql = sourceDdlSql.trim().toUpperCase(Locale.ROOT);
+        if (normalizedSourceDdlSql.startsWith("CREATE TABLE")) {
+            return Optional.of(relaxCreateTable(mappedSinkDdlSql));
         }
-        if (normalized.startsWith("CREATE INDEX")
-                || normalized.startsWith("DROP INDEX")
-                || isConstraintOrIndexOnlyAlter(normalized)) {
+        if (normalizedSourceDdlSql.startsWith("CREATE INDEX")
+                || normalizedSourceDdlSql.startsWith("DROP INDEX")
+                || isConstraintOrIndexOnlyAlter(normalizedSourceDdlSql)) {
             return Optional.empty();
         }
-        return Optional.of(mapped);
+        return Optional.of(mappedSinkDdlSql);
     }
 
-    private static String relaxCreateTable(String sql) {
-        int open = sql.indexOf('(');
-        if (open < 0) {
-            return sql;
+    private static String relaxCreateTable(String createTableSql) {
+        int openingParenthesisIndex = createTableSql.indexOf('(');
+        if (openingParenthesisIndex < 0) {
+            return createTableSql;
         }
-        int close = matchingCloseParen(sql, open);
-        if (close < 0) {
-            return sql;
+        int closingParenthesisIndex = matchingCloseParen(createTableSql, openingParenthesisIndex);
+        if (closingParenthesisIndex < 0) {
+            return createTableSql;
         }
 
-        List<String> definitions = splitTopLevel(sql.substring(open + 1, close));
-        Set<String> primaryKeyColumns = primaryKeyColumns(definitions);
-        List<String> kept = new ArrayList<>();
-        for (String definition : definitions) {
-            if (shouldKeepCreateTableDefinition(definition)) {
-                String relaxed = relaxCreateTableDefinition(definition, primaryKeyColumns);
-                if (!relaxed.isBlank()) {
-                    kept.add(relaxed);
+        List<String> tableDefinitions = splitTopLevel(createTableSql.substring(openingParenthesisIndex + 1, closingParenthesisIndex));
+        Set<String> primaryKeyColumns = primaryKeyColumns(tableDefinitions);
+        List<String> keptDefinitions = new ArrayList<>();
+        for (String tableDefinition : tableDefinitions) {
+            if (shouldKeepCreateTableDefinition(tableDefinition)) {
+                String relaxedDefinition = relaxCreateTableDefinition(tableDefinition, primaryKeyColumns);
+                if (!relaxedDefinition.isBlank()) {
+                    keptDefinitions.add(relaxedDefinition);
                 }
             }
         }
-        return sql.substring(0, open + 1)
+        return createTableSql.substring(0, openingParenthesisIndex + 1)
                 + "\n  "
-                + String.join(",\n  ", kept)
+                + String.join(",\n  ", keptDefinitions)
                 + "\n"
-                + sql.substring(close, close + 1);
+                + createTableSql.substring(closingParenthesisIndex, closingParenthesisIndex + 1);
     }
 
     private static boolean shouldKeepCreateTableDefinition(String definition) {
@@ -80,14 +80,14 @@ public final class DdlSanitizer {
         if (columnDefinition == null) {
             return stripped;
         }
-        String type = typeOnly(columnDefinition.typeAndOptions());
+        String columnType = typeOnly(columnDefinition.typeAndOptions());
         if (!primaryKeyColumns.contains(columnDefinition.name())) {
-            type = relaxedType(type);
+            columnType = relaxedType(columnType);
         }
-        if (type.isBlank()) {
+        if (columnType.isBlank()) {
             return "";
         }
-        return quoteIdentifier(columnDefinition.name()) + " " + type;
+        return quoteIdentifier(columnDefinition.name()) + " " + columnType;
     }
 
     private static Set<String> primaryKeyColumns(List<String> definitions) {
@@ -97,17 +97,17 @@ public final class DdlSanitizer {
             if (!stripped.toUpperCase(Locale.ROOT).startsWith("PRIMARY KEY")) {
                 continue;
             }
-            int open = stripped.indexOf('(');
-            int close = open < 0 ? -1 : matchingCloseParen(stripped, open);
-            if (open < 0 || close < 0) {
+            int openingParenthesisIndex = stripped.indexOf('(');
+            int closingParenthesisIndex = openingParenthesisIndex < 0 ? -1 : matchingCloseParen(stripped, openingParenthesisIndex);
+            if (openingParenthesisIndex < 0 || closingParenthesisIndex < 0) {
                 continue;
             }
-            for (String column : splitTopLevel(stripped.substring(open + 1, close))) {
-                String value = column.strip();
-                if (value.startsWith("`")) {
-                    int end = value.indexOf('`', 1);
-                    if (end > 0) {
-                        columns.add(value.substring(1, end).replace("``", "`"));
+            for (String primaryKeyColumnDefinition : splitTopLevel(stripped.substring(openingParenthesisIndex + 1, closingParenthesisIndex))) {
+                String primaryKeyColumnName = primaryKeyColumnDefinition.strip();
+                if (primaryKeyColumnName.startsWith("`")) {
+                    int closingBacktickIndex = primaryKeyColumnName.indexOf('`', 1);
+                    if (closingBacktickIndex > 0) {
+                        columns.add(primaryKeyColumnName.substring(1, closingBacktickIndex).replace("``", "`"));
                     }
                 }
             }
@@ -265,25 +265,25 @@ public final class DdlSanitizer {
                 || normalized.contains(" DROP CHECK ");
     }
 
-    private static int matchingCloseParen(String sql, int open) {
-        int depth = 0;
-        char quote = 0;
-        for (int i = open; i < sql.length(); i++) {
-            char c = sql.charAt(i);
-            if (quote != 0) {
-                if (c == quote && (quote == '`' || i == 0 || sql.charAt(i - 1) != '\\')) {
-                    quote = 0;
+    private static int matchingCloseParen(String ddlFragment, int openingParenthesisIndex) {
+        int parenthesisDepth = 0;
+        char activeQuote = 0;
+        for (int charIndex = openingParenthesisIndex; charIndex < ddlFragment.length(); charIndex++) {
+            char currentChar = ddlFragment.charAt(charIndex);
+            if (activeQuote != 0) {
+                if (currentChar == activeQuote && (activeQuote == '`' || charIndex == 0 || ddlFragment.charAt(charIndex - 1) != '\\')) {
+                    activeQuote = 0;
                 }
                 continue;
             }
-            if (c == '\'' || c == '"' || c == '`') {
-                quote = c;
-            } else if (c == '(') {
-                depth++;
-            } else if (c == ')') {
-                depth--;
-                if (depth == 0) {
-                    return i;
+            if (currentChar == '\'' || currentChar == '"' || currentChar == '`') {
+                activeQuote = currentChar;
+            } else if (currentChar == '(') {
+                parenthesisDepth++;
+            } else if (currentChar == ')') {
+                parenthesisDepth--;
+                if (parenthesisDepth == 0) {
+                    return charIndex;
                 }
             }
         }

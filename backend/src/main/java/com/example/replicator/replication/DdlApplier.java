@@ -39,40 +39,41 @@ public class DdlApplier {
         this.sinkDatabaseName = checkpointService.sinkEndpoint().database();
     }
 
-    public void apply(String sql, BinlogPosition position) {
-        Optional<String> prepared = DdlSanitizer.prepare(sql, sourceDatabaseName, sinkDatabaseName,
+    public void apply(String sourceDdlSql, BinlogPosition ddlPosition) {
+        Optional<String> sanitizedDdlSql = DdlSanitizer.prepare(sourceDdlSql, sourceDatabaseName, sinkDatabaseName,
                 checkpointService.properties().getReplication().isStrictDdl());
-        long start = System.currentTimeMillis();
-        if (prepared.isEmpty()) {
+        long startTimeMillis = System.currentTimeMillis();
+        if (sanitizedDdlSql.isEmpty()) {
+            // Relaxed mode intentionally skips constraint/index-only DDL to keep CDC writable.
             metadataService.invalidate(null);
-            checkpointService.save(position);
-            checkpointService.saveTableEvents(Collections.singletonList(tableName(sql)), position);
+            checkpointService.save(ddlPosition);
+            checkpointService.saveTableEvents(Collections.singletonList(tableName(sourceDdlSql)), ddlPosition);
             log.warn("Skipped relaxed DDL sql=\"{}\" binlog={}:{} durationMs={}",
-                    sql, position.binlogFile(), position.binlogPosition(), System.currentTimeMillis() - start);
+                    sourceDdlSql, ddlPosition.binlogFile(), ddlPosition.binlogPosition(), System.currentTimeMillis() - startTimeMillis);
             return;
         }
-        String mapped = prepared.get();
+        String sinkDdlSql = sanitizedDdlSql.get();
         try {
-            sinkJdbcTemplate.execute(mapped);
+            sinkJdbcTemplate.execute(sinkDdlSql);
             metadataService.invalidate(null);
-            checkpointService.save(position);
-            checkpointService.saveTableEvents(Collections.singletonList(tableName(sql)), position);
+            checkpointService.save(ddlPosition);
+            checkpointService.saveTableEvents(Collections.singletonList(tableName(sourceDdlSql)), ddlPosition);
             log.info("Applied DDL sql=\"{}\" binlog={}:{} durationMs={}",
-                    mapped, position.binlogFile(), position.binlogPosition(), System.currentTimeMillis() - start);
+                    sinkDdlSql, ddlPosition.binlogFile(), ddlPosition.binlogPosition(), System.currentTimeMillis() - startTimeMillis);
         } catch (RuntimeException e) {
-            if (!isCreateTableAlreadyExists(sql, e)) {
+            if (!isCreateTableAlreadyExists(sourceDdlSql, e)) {
                 throw e;
             }
             metadataService.invalidate(null);
-            checkpointService.save(position);
-            checkpointService.saveTableEvents(Collections.singletonList(tableName(sql)), position);
+            checkpointService.save(ddlPosition);
+            checkpointService.saveTableEvents(Collections.singletonList(tableName(sourceDdlSql)), ddlPosition);
             log.warn("Skipped CREATE TABLE because sinkJdbcTemplate table already exists sql=\"{}\" binlog={}:{} durationMs={}",
-                    mapped, position.binlogFile(), position.binlogPosition(), System.currentTimeMillis() - start);
+                    sinkDdlSql, ddlPosition.binlogFile(), ddlPosition.binlogPosition(), System.currentTimeMillis() - startTimeMillis);
         }
     }
 
-    private boolean isCreateTableAlreadyExists(String sql, Throwable error) {
-        if (!sql.trim().toUpperCase(Locale.ROOT).startsWith("CREATE TABLE")) {
+    private boolean isCreateTableAlreadyExists(String sourceDdlSql, Throwable error) {
+        if (!sourceDdlSql.trim().toUpperCase(Locale.ROOT).startsWith("CREATE TABLE")) {
             return false;
         }
         Throwable current = error;
@@ -85,10 +86,10 @@ public class DdlApplier {
         return false;
     }
 
-    private String tableName(String sql) {
-        Matcher matcher = FIRST_QUOTED_NAME.matcher(sql);
-        if (matcher.find()) {
-            return matcher.group(1);
+    private String tableName(String ddlSql) {
+        Matcher quotedTableNameMatcher = FIRST_QUOTED_NAME.matcher(ddlSql);
+        if (quotedTableNameMatcher.find()) {
+            return quotedTableNameMatcher.group(1);
         }
         return null;
     }

@@ -112,8 +112,8 @@ public class ReplicationService implements ApplicationRunner {
         checkpointService.refreshStatus(true, false, null);
         try {
             retryer.run("replication", log, () -> {
-                BinlogPosition checkpoint = snapshotService.runIfNeeded();
-                connect(checkpoint);
+                BinlogPosition resumePosition = snapshotService.runIfNeeded();
+                connect(resumePosition);
             });
         } catch (Exception e) {
             running.set(false);
@@ -127,22 +127,22 @@ public class ReplicationService implements ApplicationRunner {
         }
     }
 
-    private void connect(BinlogPosition checkpoint) throws Exception {
+    private void connect(BinlogPosition resumePosition) throws Exception {
         JdbcUrlParser.MysqlEndpoint endpoint = checkpointService.sourceEndpoint();
         BinaryLogClient binaryLogClient = new BinaryLogClient(endpoint.host(), endpoint.port(),
                 checkpointService.properties().getSource().getUsername(),
                 checkpointService.properties().getSource().getPassword());
         binaryLogClient.setServerId(checkpointService.properties().getReplication().getServerId());
-        if (checkpoint != null) {
-            if (checkpoint.binlogFile() != null && checkpoint.binlogPosition() != null) {
-                binaryLogClient.setBinlogFilename(checkpoint.binlogFile());
-                binaryLogClient.setBinlogPosition(checkpoint.binlogPosition());
+        if (resumePosition != null) {
+            if (resumePosition.binlogFile() != null && resumePosition.binlogPosition() != null) {
+                binaryLogClient.setBinlogFilename(resumePosition.binlogFile());
+                binaryLogClient.setBinlogPosition(resumePosition.binlogPosition());
                 log.info("Starting binlog client from checkpoint file={} position={}",
-                        checkpoint.binlogFile(), checkpoint.binlogPosition());
+                        resumePosition.binlogFile(), resumePosition.binlogPosition());
             } else if (checkpointService.properties().getReplication().isUseGtid()
-                    && checkpoint.gtidSet() != null && !checkpoint.gtidSet().isBlank()) {
-                binaryLogClient.setGtidSet(checkpoint.gtidSet());
-                log.info("Starting binlog client from checkpoint GTID set={}", checkpoint.gtidSet());
+                    && resumePosition.gtidSet() != null && !resumePosition.gtidSet().isBlank()) {
+                binaryLogClient.setGtidSet(resumePosition.gtidSet());
+                log.info("Starting binlog client from checkpoint GTID set={}", resumePosition.gtidSet());
             }
         }
         BinlogEventHandler handler = new BinlogEventHandler(binaryLogClient);
@@ -165,7 +165,7 @@ public class ReplicationService implements ApplicationRunner {
     private class BinlogEventHandler {
         private final BinaryLogClient client;
         private final Map<Long, TableMapEventData> tablesById = new HashMap<>();
-        private final List<RowChange> transaction = new ArrayList<>();
+        private final List<RowChange> pendingTransactionChanges = new ArrayList<>();
         private String currentGtid;
 
         BinlogEventHandler(BinaryLogClient client) {
@@ -178,24 +178,24 @@ public class ReplicationService implements ApplicationRunner {
                     disconnect();
                     return;
                 }
-                EventData data = event.getData();
-                if (data instanceof GtidEventData gtid) {
-                    currentGtid = gtid.getGtid();
-                } else if (data instanceof TableMapEventData tableMap) {
+                EventData eventData = event.getData();
+                if (eventData instanceof GtidEventData gtidEventData) {
+                    currentGtid = gtidEventData.getGtid();
+                } else if (eventData instanceof TableMapEventData tableMap) {
                     tablesById.put(tableMap.getTableId(), tableMap);
                 } else if (checkpointService.properties().getReplication().isDmlEnabled()
-                        && data instanceof WriteRowsEventData rows) {
-                    collectRows(RowChange.Kind.INSERT, rows.getTableId(), null, rows.getRows(), event);
+                        && eventData instanceof WriteRowsEventData writeRowsEventData) {
+                    collectRows(RowChange.Kind.INSERT, writeRowsEventData.getTableId(), null, writeRowsEventData.getRows(), event);
                 } else if (checkpointService.properties().getReplication().isDmlEnabled()
-                        && data instanceof UpdateRowsEventData rows) {
-                    collectUpdates(rows, event);
+                        && eventData instanceof UpdateRowsEventData updateRowsEventData) {
+                    collectUpdates(updateRowsEventData, event);
                 } else if (checkpointService.properties().getReplication().isDmlEnabled()
-                        && data instanceof DeleteRowsEventData rows) {
-                    collectRows(RowChange.Kind.DELETE, rows.getTableId(), rows.getRows(), null, event);
+                        && eventData instanceof DeleteRowsEventData deleteRowsEventData) {
+                    collectRows(RowChange.Kind.DELETE, deleteRowsEventData.getTableId(), deleteRowsEventData.getRows(), null, event);
                 } else if (isCommit(event)) {
                     commitTransaction(event);
-                } else if (data instanceof QueryEventData query) {
-                    handleQuery(event, query);
+                } else if (eventData instanceof QueryEventData queryEventData) {
+                    handleQuery(event, queryEventData);
                 }
             } catch (Exception e) {
                 log.error("Replication failed eventType={} binlog={}:{} gtid={} error={}",
@@ -210,98 +210,102 @@ public class ReplicationService implements ApplicationRunner {
             if (!isSourceTable(tableId)) {
                 return;
             }
-            String table = tableName(tableId);
-            if (!tableFilter.accepts(table)) {
+            String tableName = tableName(tableId);
+            if (!tableFilter.accepts(tableName)) {
                 return;
             }
-            BinlogPosition position = position(event, kind.name(), table);
+            BinlogPosition rowEventPosition = position(event, kind.name(), tableName);
             if (kind == RowChange.Kind.INSERT) {
-                for (Serializable[] row : afterRows) {
-                    transaction.add(new RowChange(kind, table, null, row, position));
+                for (Serializable[] afterImage : afterRows) {
+                    pendingTransactionChanges.add(new RowChange(kind, tableName, null, afterImage, rowEventPosition));
                 }
             } else {
-                for (Serializable[] row : beforeRows) {
-                    transaction.add(new RowChange(kind, table, row, null, position));
+                for (Serializable[] beforeImage : beforeRows) {
+                    pendingTransactionChanges.add(new RowChange(kind, tableName, beforeImage, null, rowEventPosition));
                 }
             }
         }
 
-        private void collectUpdates(UpdateRowsEventData rows, Event event) {
-            if (!isSourceTable(rows.getTableId())) {
+        private void collectUpdates(UpdateRowsEventData updateRowsEventData, Event event) {
+            if (!isSourceTable(updateRowsEventData.getTableId())) {
                 return;
             }
-            String table = tableName(rows.getTableId());
-            if (!tableFilter.accepts(table)) {
+            String tableName = tableName(updateRowsEventData.getTableId());
+            if (!tableFilter.accepts(tableName)) {
                 return;
             }
-            BinlogPosition position = position(event, "UPDATE", table);
-            for (Map.Entry<Serializable[], Serializable[]> row : rows.getRows()) {
-                transaction.add(new RowChange(RowChange.Kind.UPDATE, table, row.getKey(), row.getValue(), position));
+            BinlogPosition rowEventPosition = position(event, "UPDATE", tableName);
+            for (Map.Entry<Serializable[], Serializable[]> rowImages : updateRowsEventData.getRows()) {
+                pendingTransactionChanges.add(new RowChange(RowChange.Kind.UPDATE, tableName,
+                        rowImages.getKey(), rowImages.getValue(), rowEventPosition));
             }
         }
 
-        private void handleQuery(Event event, QueryEventData query) throws Exception {
-            String sql = query.getSql();
-            String normalized = sql.trim().toUpperCase(Locale.ROOT);
-            if ("BEGIN".equals(normalized)) {
-                transaction.clear();
+        private void handleQuery(Event event, QueryEventData queryEventData) throws Exception {
+            String querySql = queryEventData.getSql();
+            String normalizedQuerySql = querySql.trim().toUpperCase(Locale.ROOT);
+            if ("BEGIN".equals(normalizedQuerySql)) {
+                pendingTransactionChanges.clear();
                 return;
             }
-            if ("COMMIT".equals(normalized)) {
+            if ("COMMIT".equals(normalizedQuerySql)) {
                 commitTransaction(event);
                 return;
             }
-            if (!checkpointService.properties().getReplication().isDdlEnabled() || !isSupportedDdl(normalized)) {
+            if (!checkpointService.properties().getReplication().isDdlEnabled() || !isSupportedDdl(normalizedQuerySql)) {
                 return;
             }
-            if (query.getDatabase() != null && !query.getDatabase().isBlank()
-                    && !query.getDatabase().equalsIgnoreCase(checkpointService.sourceEndpoint().database())) {
+            if (queryEventData.getDatabase() != null && !queryEventData.getDatabase().isBlank()
+                    && !queryEventData.getDatabase().equalsIgnoreCase(checkpointService.sourceEndpoint().database())) {
                 return;
             }
-            ddlApplier.apply(sql, position(event, "DDL", null));
+            ddlApplier.apply(querySql, position(event, "DDL", null));
         }
 
         private void commitTransaction(Event event) throws Exception {
-            if (transaction.isEmpty()) {
+            if (pendingTransactionChanges.isEmpty()) {
                 return;
             }
-            BinlogPosition position = position(event, "COMMIT", lastTable());
-            dmlApplier.applyTransaction(new ArrayList<>(transaction), position);
-            transaction.clear();
+            // Apply all row events atomically at XID/COMMIT and save the matching checkpoint.
+            BinlogPosition commitPosition = position(event, "COMMIT", lastChangedTable());
+            dmlApplier.applyTransaction(new ArrayList<>(pendingTransactionChanges), commitPosition);
+            pendingTransactionChanges.clear();
         }
 
         private boolean isCommit(Event event) {
             return event.getHeader().getEventType() == EventType.XID;
         }
 
-        private boolean isSupportedDdl(String sql) {
-            return sql.startsWith("CREATE TABLE")
-                    || sql.startsWith("ALTER TABLE")
-                    || sql.startsWith("DROP TABLE")
-                    || sql.startsWith("RENAME TABLE")
-                    || sql.startsWith("TRUNCATE TABLE")
-                    || sql.startsWith("CREATE INDEX")
-                    || sql.startsWith("DROP INDEX");
+        private boolean isSupportedDdl(String normalizedQuerySql) {
+            return normalizedQuerySql.startsWith("CREATE TABLE")
+                    || normalizedQuerySql.startsWith("ALTER TABLE")
+                    || normalizedQuerySql.startsWith("DROP TABLE")
+                    || normalizedQuerySql.startsWith("RENAME TABLE")
+                    || normalizedQuerySql.startsWith("TRUNCATE TABLE")
+                    || normalizedQuerySql.startsWith("CREATE INDEX")
+                    || normalizedQuerySql.startsWith("DROP INDEX");
         }
 
         private String tableName(long tableId) {
-            TableMapEventData table = tablesById.get(tableId);
-            if (table == null) {
+            TableMapEventData tableMap = tablesById.get(tableId);
+            if (tableMap == null) {
                 throw new IllegalStateException("Missing table map for tableId " + tableId);
             }
-            return table.getTable();
+            return tableMap.getTable();
         }
 
         private boolean isSourceTable(long tableId) {
-            TableMapEventData table = tablesById.get(tableId);
-            if (table == null) {
+            TableMapEventData tableMap = tablesById.get(tableId);
+            if (tableMap == null) {
                 throw new IllegalStateException("Missing table map for tableId " + tableId);
             }
-            return table.getDatabase().equalsIgnoreCase(checkpointService.sourceEndpoint().database());
+            return tableMap.getDatabase().equalsIgnoreCase(checkpointService.sourceEndpoint().database());
         }
 
-        private String lastTable() {
-            return transaction.isEmpty() ? null : transaction.get(transaction.size() - 1).table();
+        private String lastChangedTable() {
+            return pendingTransactionChanges.isEmpty()
+                    ? null
+                    : pendingTransactionChanges.get(pendingTransactionChanges.size() - 1).table();
         }
 
         private BinlogPosition position(Event event, String eventType, String table) {
@@ -314,8 +318,8 @@ public class ReplicationService implements ApplicationRunner {
         }
 
         private LocalDateTime eventTime(Event event) {
-            long millis = ((EventHeaderV4) event.getHeader()).getTimestamp();
-            return LocalDateTime.ofInstant(Instant.ofEpochMilli(millis), ZoneId.systemDefault());
+            long eventTimestampMillis = ((EventHeaderV4) event.getHeader()).getTimestamp();
+            return LocalDateTime.ofInstant(Instant.ofEpochMilli(eventTimestampMillis), ZoneId.systemDefault());
         }
     }
 }

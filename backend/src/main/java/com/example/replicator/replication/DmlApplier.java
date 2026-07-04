@@ -93,14 +93,16 @@ public class DmlApplier {
 
     private void applyOne(Connection connection, RowChange change) throws Exception {
         metadataService.ensureSinkTable(change.table());
-        TableMetadata metadata = metadataService.table(change.table());
-        if (metadata.columns().isEmpty()) {
+        TableMetadata tableMetadata = metadataService.table(change.table());
+        if (tableMetadata.columns().isEmpty()) {
             throw new IllegalStateException("No source columns found for table " + change.table()
                     + " at binlog " + change.position().binlogFile() + ":" + change.position().binlogPosition());
         }
         try {
-            applyOne(connection, change, metadata);
+            applyOne(connection, change, tableMetadata);
         } catch (Exception e) {
+            // Replication can observe DML before the sink has the table or widened columns.
+            // Recover once from source metadata before failing the transaction.
             if (isMissingTable(e)) {
                 log.warn("Sink table is missing table={}, recreating from source DDL before applying {}", change.table(), change.kind());
                 metadataService.invalidate(change.table());
@@ -120,16 +122,16 @@ public class DmlApplier {
         }
     }
 
-    private void applyOne(Connection connection, RowChange change, TableMetadata metadata) throws Exception {
+    private void applyOne(Connection connection, RowChange change, TableMetadata tableMetadata) throws Exception {
         if (change.kind() != RowChange.Kind.INSERT
                 && checkpointService.properties().getReplication().isRequirePrimaryKey()
-                && !metadata.hasPrimaryKey()) {
+                && !tableMetadata.hasPrimaryKey()) {
             throw new IllegalStateException("Missing primary key for table " + change.table());
         }
         switch (change.kind()) {
-            case INSERT -> applyInsert(connection, metadata, change.after());
-            case UPDATE -> applyUpdate(connection, metadata, change.before(), change.after());
-            case DELETE -> applyDelete(connection, metadata, change.before());
+            case INSERT -> applyInsert(connection, tableMetadata, change.after());
+            case UPDATE -> applyUpdate(connection, tableMetadata, change.before(), change.after());
+            case DELETE -> applyDelete(connection, tableMetadata, change.before());
         }
     }
 
@@ -160,79 +162,82 @@ public class DmlApplier {
         return null;
     }
 
-    private void applyInsert(Connection connection, TableMetadata metadata, Object[] values) throws Exception {
-        String columns = String.join(",", metadata.columns().stream().map(SqlNames::quote).toList());
-        String placeholders = String.join(",", metadata.columns().stream().map(c -> "?").toList());
-        String sql = "INSERT INTO " + SqlNames.qualified(sinkDatabaseName, metadata.table()) + " (" + columns + ") VALUES (" + placeholders + ")";
+    private void applyInsert(Connection connection, TableMetadata tableMetadata, Object[] rowValues) throws Exception {
+        String columnListSql = String.join(",", tableMetadata.columns().stream().map(SqlNames::quote).toList());
+        String valuePlaceholdersSql = String.join(",", tableMetadata.columns().stream().map(column -> "?").toList());
+        String insertSql = "INSERT INTO " + SqlNames.qualified(sinkDatabaseName, tableMetadata.table())
+                + " (" + columnListSql + ") VALUES (" + valuePlaceholdersSql + ")";
         if ("upsert".equalsIgnoreCase(checkpointService.properties().getReplication().getOnDuplicateInsert())) {
-            StringJoiner update = new StringJoiner(",");
-            for (String column : metadata.columns()) {
-                update.add(SqlNames.quote(column) + " = VALUES(" + SqlNames.quote(column) + ")");
+            StringJoiner duplicateKeyAssignments = new StringJoiner(",");
+            for (String column : tableMetadata.columns()) {
+                duplicateKeyAssignments.add(SqlNames.quote(column) + " = VALUES(" + SqlNames.quote(column) + ")");
             }
-            sql += " ON DUPLICATE KEY UPDATE " + update;
+            insertSql += " ON DUPLICATE KEY UPDATE " + duplicateKeyAssignments;
         }
-        try (PreparedStatement ps = connection.prepareStatement(sql)) {
-            bindValues(ps, metadata, values, 1);
-            ps.executeUpdate();
+        try (PreparedStatement insertStatement = connection.prepareStatement(insertSql)) {
+            bindValues(insertStatement, tableMetadata, rowValues, 1);
+            insertStatement.executeUpdate();
         }
     }
 
-    private void applyUpdate(Connection connection, TableMetadata metadata, Object[] before, Object[] after) throws Exception {
-        StringJoiner set = new StringJoiner(",");
-        for (String column : metadata.columns()) {
-            if (!metadata.primaryKeys().contains(column)) {
-                set.add(SqlNames.quote(column) + " = ?");
+    private void applyUpdate(Connection connection, TableMetadata tableMetadata, Object[] beforeImage, Object[] afterImage) throws Exception {
+        StringJoiner changedColumnAssignments = new StringJoiner(",");
+        for (String column : tableMetadata.columns()) {
+            if (!tableMetadata.primaryKeys().contains(column)) {
+                changedColumnAssignments.add(SqlNames.quote(column) + " = ?");
             }
         }
-        String where = pkWhere(metadata);
-        String sql = "UPDATE " + SqlNames.qualified(sinkDatabaseName, metadata.table()) + " SET " + set + " WHERE " + where;
-        try (PreparedStatement ps = connection.prepareStatement(sql)) {
-            int index = 1;
-            for (String column : metadata.columns()) {
-                if (!metadata.primaryKeys().contains(column)) {
-                    ps.setObject(index++, normalize(after[metadata.sourceIndex(column)]));
+        String primaryKeyWhereSql = primaryKeyWhereClause(tableMetadata);
+        String updateSql = "UPDATE " + SqlNames.qualified(sinkDatabaseName, tableMetadata.table())
+                + " SET " + changedColumnAssignments + " WHERE " + primaryKeyWhereSql;
+        try (PreparedStatement updateStatement = connection.prepareStatement(updateSql)) {
+            int parameterIndex = 1;
+            for (String column : tableMetadata.columns()) {
+                if (!tableMetadata.primaryKeys().contains(column)) {
+                    updateStatement.setObject(parameterIndex++, normalize(afterImage[tableMetadata.sourceIndex(column)]));
                 }
             }
-            bindPrimaryKeys(ps, metadata, before, index);
-            int affected = ps.executeUpdate();
-            if (affected == 0) {
-                log.warn("UPDATE found no sinkJdbcTemplate row table={}, applying after image as insert", metadata.table());
-                applyInsert(connection, metadata, after);
+            bindPrimaryKeys(updateStatement, tableMetadata, beforeImage, parameterIndex);
+            int affectedRows = updateStatement.executeUpdate();
+            if (affectedRows == 0) {
+                log.warn("UPDATE found no sinkJdbcTemplate row table={}, applying after image as insert", tableMetadata.table());
+                applyInsert(connection, tableMetadata, afterImage);
             }
         }
     }
 
-    private void applyDelete(Connection connection, TableMetadata metadata, Object[] before) throws Exception {
-        String sql = "DELETE FROM " + SqlNames.qualified(sinkDatabaseName, metadata.table()) + " WHERE " + pkWhere(metadata);
-        try (PreparedStatement ps = connection.prepareStatement(sql)) {
-            bindPrimaryKeys(ps, metadata, before, 1);
-            int affected = ps.executeUpdate();
-            if (affected == 0) {
-                log.warn("DELETE found no sinkJdbcTemplate row table={}", metadata.table());
+    private void applyDelete(Connection connection, TableMetadata tableMetadata, Object[] beforeImage) throws Exception {
+        String deleteSql = "DELETE FROM " + SqlNames.qualified(sinkDatabaseName, tableMetadata.table())
+                + " WHERE " + primaryKeyWhereClause(tableMetadata);
+        try (PreparedStatement deleteStatement = connection.prepareStatement(deleteSql)) {
+            bindPrimaryKeys(deleteStatement, tableMetadata, beforeImage, 1);
+            int affectedRows = deleteStatement.executeUpdate();
+            if (affectedRows == 0) {
+                log.warn("DELETE found no sinkJdbcTemplate row table={}", tableMetadata.table());
             }
         }
     }
 
-    private String pkWhere(TableMetadata metadata) {
-        StringJoiner where = new StringJoiner(" AND ");
-        for (String pk : metadata.primaryKeys()) {
-            where.add(SqlNames.quote(pk) + " = ?");
+    private String primaryKeyWhereClause(TableMetadata tableMetadata) {
+        StringJoiner whereClause = new StringJoiner(" AND ");
+        for (String primaryKeyColumn : tableMetadata.primaryKeys()) {
+            whereClause.add(SqlNames.quote(primaryKeyColumn) + " = ?");
         }
-        return where.toString();
+        return whereClause.toString();
     }
 
-    private void bindPrimaryKeys(PreparedStatement ps, TableMetadata metadata, Object[] values, int startIndex) throws Exception {
-        int index = startIndex;
-        for (String pk : metadata.primaryKeys()) {
-            int columnIndex = metadata.sourceIndex(pk);
-            ps.setObject(index++, normalize(values[columnIndex]));
+    private void bindPrimaryKeys(PreparedStatement statement, TableMetadata tableMetadata, Object[] rowValues, int startIndex) throws Exception {
+        int parameterIndex = startIndex;
+        for (String primaryKeyColumn : tableMetadata.primaryKeys()) {
+            int sourceColumnIndex = tableMetadata.sourceIndex(primaryKeyColumn);
+            statement.setObject(parameterIndex++, normalize(rowValues[sourceColumnIndex]));
         }
     }
 
-    private void bindValues(PreparedStatement ps, TableMetadata metadata, Object[] values, int startIndex) throws Exception {
-        int index = startIndex;
-        for (String column : metadata.columns()) {
-            ps.setObject(index++, normalize(values[metadata.sourceIndex(column)]));
+    private void bindValues(PreparedStatement statement, TableMetadata tableMetadata, Object[] rowValues, int startIndex) throws Exception {
+        int parameterIndex = startIndex;
+        for (String column : tableMetadata.columns()) {
+            statement.setObject(parameterIndex++, normalize(rowValues[tableMetadata.sourceIndex(column)]));
         }
     }
 

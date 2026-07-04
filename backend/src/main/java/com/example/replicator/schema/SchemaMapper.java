@@ -8,10 +8,10 @@ public class SchemaMapper {
     private SchemaMapper() {
     }
 
-    public static String mapDdl(String sql, String sourceDatabaseName, String sinkDatabaseName) {
-        String mapped = sql;
-        mapped = mapped.replace(SqlNames.quote(sourceDatabaseName) + ".", SqlNames.quote(sinkDatabaseName) + ".");
-        mapped = mapped.replaceAll("(?i)\\b" + Pattern.quote(sourceDatabaseName) + "\\.", sinkDatabaseName + ".");
-        return mapped;
+    public static String mapDdl(String sourceDdlSql, String sourceDatabaseName, String sinkDatabaseName) {
+        String sinkDdlSql = sourceDdlSql;
+        sinkDdlSql = sinkDdlSql.replace(SqlNames.quote(sourceDatabaseName) + ".", SqlNames.quote(sinkDatabaseName) + ".");
+        sinkDdlSql = sinkDdlSql.replaceAll("(?i)\\b" + Pattern.quote(sourceDatabaseName) + "\\.", sinkDatabaseName + ".");
+        return sinkDdlSql;
     }
 }

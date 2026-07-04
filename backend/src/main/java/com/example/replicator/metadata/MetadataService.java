@@ -51,33 +51,34 @@ public class MetadataService {
                 return;
             }
             if (!sinkTableExists(table)) {
-                Map<String, Object> row = sourceJdbcTemplate.queryForMap("SHOW CREATE TABLE " + SqlNames.qualified(sourceDatabaseName, table));
-                String ddl = String.valueOf(row.get("Create Table"));
-                String mapped = DdlSanitizer.prepare(ddl, sourceDatabaseName, sinkDatabaseName, strictDdl)
+                Map<String, Object> createTableResult = sourceJdbcTemplate.queryForMap("SHOW CREATE TABLE " + SqlNames.qualified(sourceDatabaseName, table));
+                String sourceCreateTableDdl = String.valueOf(createTableResult.get("Create Table"));
+                String sinkCreateTableDdl = DdlSanitizer.prepare(sourceCreateTableDdl, sourceDatabaseName, sinkDatabaseName, strictDdl)
                         .orElseThrow(() -> new IllegalStateException("CREATE TABLE DDL was skipped for table " + table));
-                sinkJdbcTemplate.execute(mapped);
+                sinkJdbcTemplate.execute(sinkCreateTableDdl);
                 invalidate(table);
-                log.info("Created missing sinkJdbcTemplate table from sourceJdbcTemplate DDL table={} ddl=\"{}\"", table, mapped);
+                log.info("Created missing sinkJdbcTemplate table from sourceJdbcTemplate DDL table={} ddl=\"{}\"", table, sinkCreateTableDdl);
             }
             ensuredSinkTables.add(table);
         }
     }
 
     public void widenSinkColumn(String table, String column) {
-        List<String> types = sourceJdbcTemplate.query("""
+        List<String> sourceColumnTypes = sourceJdbcTemplate.query("""
                         SELECT COLUMN_TYPE
                         FROM INFORMATION_SCHEMA.COLUMNS
                         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = ?
                         """,
-                (rs, rowNum) -> rs.getString(1), sourceDatabaseName, table, column);
-        if (types.isEmpty()) {
+                (resultSet, rowNumber) -> resultSet.getString(1), sourceDatabaseName, table, column);
+        if (sourceColumnTypes.isEmpty()) {
             throw new IllegalStateException("Cannot widen missing sourceJdbcTemplate column " + table + "." + column);
         }
-        String relaxedType = DdlSanitizer.relaxedType(types.get(0));
-        if (relaxedType.equalsIgnoreCase(types.get(0))) {
+        String relaxedType = DdlSanitizer.relaxedType(sourceColumnTypes.get(0));
+        if (relaxedType.equalsIgnoreCase(sourceColumnTypes.get(0))) {
             throw new IllegalStateException("No relaxed wider type available for column " + table + "." + column
-                    + " sourceType=" + types.get(0));
+                    + " sourceType=" + sourceColumnTypes.get(0));
         }
+        // Widen only after a real truncation error so relaxed mode preserves stricter sink columns when possible.
         sinkJdbcTemplate.execute("ALTER TABLE " + SqlNames.qualified(sinkDatabaseName, table)
                 + " MODIFY COLUMN " + SqlNames.quote(column) + " " + relaxedType);
         invalidate(table);
@@ -111,7 +112,7 @@ public class MetadataService {
                         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
                         ORDER BY ORDINAL_POSITION
                         """,
-                (rs, rowNum) -> rs.getString(1), sourceDatabaseName, table);
+                (resultSet, rowNumber) -> resultSet.getString(1), sourceDatabaseName, table);
         List<String> columns = sourceJdbcTemplate.query("""
                         SELECT COLUMN_NAME
                         FROM INFORMATION_SCHEMA.COLUMNS
@@ -119,14 +120,14 @@ public class MetadataService {
                           AND EXTRA NOT LIKE '%GENERATED%'
                         ORDER BY ORDINAL_POSITION
                         """,
-                (rs, rowNum) -> rs.getString(1), sourceDatabaseName, table);
+                (resultSet, rowNumber) -> resultSet.getString(1), sourceDatabaseName, table);
         Set<String> primaryKeys = new LinkedHashSet<>(sourceJdbcTemplate.query("""
                         SELECT COLUMN_NAME
                         FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
                         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND CONSTRAINT_NAME = 'PRIMARY'
                         ORDER BY ORDINAL_POSITION
                         """,
-                (rs, rowNum) -> rs.getString(1), sourceDatabaseName, table));
+                (resultSet, rowNumber) -> resultSet.getString(1), sourceDatabaseName, table));
         return new TableMetadata(table, columns, primaryKeys, sourceColumns);
     }
 }

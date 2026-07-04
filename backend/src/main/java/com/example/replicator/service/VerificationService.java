@@ -50,7 +50,7 @@ public class VerificationService {
                         WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE'
                         ORDER BY TABLE_NAME
                         """,
-                (rs, rowNum) -> rs.getString(1), sourceDatabaseName);
+                (resultSet, rowNumber) -> resultSet.getString(1), sourceDatabaseName);
         List<TableVerificationStatus> results = new ArrayList<>();
         for (String table : tables) {
             if (!tableFilter.accepts(table)) {
@@ -141,27 +141,28 @@ public class VerificationService {
         }
     }
 
-    private HashResult hash(JdbcTemplate jdbc, String database, String table, TableMetadata metadata, Integer limit) {
-        String rowHash = "CRC32(CONCAT_WS(CHAR(31), " + columnExpressions(metadata.columns()) + "))";
-        String from = SqlNames.qualified(database, table);
-        String sql;
+    private HashResult hash(JdbcTemplate jdbcTemplate, String databaseName, String table, TableMetadata tableMetadata, Integer limit) {
+        // CHAR(31) is a low-risk separator for deterministic row checksums across source and sink.
+        String rowChecksumExpression = "CRC32(CONCAT_WS(CHAR(31), " + columnExpressions(tableMetadata.columns()) + "))";
+        String qualifiedTableName = SqlNames.qualified(databaseName, table);
+        String checksumSql;
         if (limit == null) {
-            sql = "SELECT COUNT(*) AS row_count, "
-                    + "COALESCE(BIT_XOR(CAST(" + rowHash + " AS UNSIGNED)), 0) AS xor_checksum, "
-                    + "COALESCE(SUM(CAST(" + rowHash + " AS UNSIGNED)), 0) AS sum_checksum "
-                    + "FROM " + from;
+            checksumSql = "SELECT COUNT(*) AS row_count, "
+                    + "COALESCE(BIT_XOR(CAST(" + rowChecksumExpression + " AS UNSIGNED)), 0) AS xor_checksum, "
+                    + "COALESCE(SUM(CAST(" + rowChecksumExpression + " AS UNSIGNED)), 0) AS sum_checksum "
+                    + "FROM " + qualifiedTableName;
         } else {
-            sql = "SELECT COUNT(*) AS row_count, "
-                    + "COALESCE(BIT_XOR(CAST(" + rowHash + " AS UNSIGNED)), 0) AS xor_checksum, "
-                    + "COALESCE(SUM(CAST(" + rowHash + " AS UNSIGNED)), 0) AS sum_checksum "
-                    + "FROM (SELECT * FROM " + from + " ORDER BY " + orderBy(metadata.primaryKeys())
+            checksumSql = "SELECT COUNT(*) AS row_count, "
+                    + "COALESCE(BIT_XOR(CAST(" + rowChecksumExpression + " AS UNSIGNED)), 0) AS xor_checksum, "
+                    + "COALESCE(SUM(CAST(" + rowChecksumExpression + " AS UNSIGNED)), 0) AS sum_checksum "
+                    + "FROM (SELECT * FROM " + qualifiedTableName + " ORDER BY " + orderBy(tableMetadata.primaryKeys())
                     + " LIMIT " + limit + ") v";
         }
-        Map<String, Object> row = jdbc.queryForMap(sql);
+        Map<String, Object> checksumRow = jdbcTemplate.queryForMap(checksumSql);
         return new HashResult(
-                ((Number) row.get("row_count")).longValue(),
-                String.valueOf(row.get("xor_checksum")),
-                String.valueOf(row.get("sum_checksum"))
+                ((Number) checksumRow.get("row_count")).longValue(),
+                String.valueOf(checksumRow.get("xor_checksum")),
+                String.valueOf(checksumRow.get("sum_checksum"))
         );
     }
 
@@ -173,14 +174,14 @@ public class VerificationService {
     }
 
     private String orderBy(Iterable<String> primaryKeys) {
-        StringBuilder builder = new StringBuilder();
+        StringBuilder orderByClause = new StringBuilder();
         for (String primaryKey : primaryKeys) {
-            if (!builder.isEmpty()) {
-                builder.append(", ");
+            if (!orderByClause.isEmpty()) {
+                orderByClause.append(", ");
             }
-            builder.append(SqlNames.quote(primaryKey)).append(" ASC");
+            orderByClause.append(SqlNames.quote(primaryKey)).append(" ASC");
         }
-        return builder.toString();
+        return orderByClause.toString();
     }
 
     private record HashResult(long rows, String xorChecksum, String sumChecksum) {

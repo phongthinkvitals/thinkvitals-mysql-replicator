@@ -56,31 +56,32 @@ public class SnapshotService {
     }
 
     public BinlogPosition runIfNeeded() throws Exception {
-        var checkpoint = checkpointService.load();
-        if (checkpoint.isPresent()
+        var savedCheckpoint = checkpointService.load();
+        if (savedCheckpoint.isPresent()
                 || !"initial".equalsIgnoreCase(checkpointService.properties().getReplication().getSnapshotMode())) {
-            checkpoint.ifPresent(position -> log.info("Resuming replication from checkpoint binlog={}:{} gtid={} lastEventType={} table={}",
+            savedCheckpoint.ifPresent(position -> log.info("Resuming replication from checkpoint binlog={}:{} gtid={} lastEventType={} table={}",
                     position.binlogFile(), position.binlogPosition(), position.gtidSet(),
                     position.lastEventType(), position.lastTableName()));
-            return checkpoint.orElse(null);
+            return savedCheckpoint.orElse(null);
         }
 
         log.info("No checkpoint found for sourceJdbcTemplate database {}; running initial snapshot", sourceDatabaseName);
         try (Connection lockConnection = sourceDataSource.getConnection()) {
-            boolean locked = tryReadLock(lockConnection);
-            if (!locked) {
+            // Capture a stable binlog position before copying data so CDC can resume after the snapshot.
+            boolean sourceReadLockAcquired = tryReadLock(lockConnection);
+            if (!sourceReadLockAcquired) {
                 log.warn("Source user cannot run FLUSH TABLES WITH READ LOCK; snapshot may be inconsistent if writes occur during copy");
             }
             try {
-                BinlogPosition position = currentSourcePosition(lockConnection);
+                BinlogPosition snapshotBinlogPosition = currentSourcePosition(lockConnection);
                 createSinkDatabase();
-                List<String> tables = listTables();
-                for (String table : tables) {
+                List<String> snapshotTables = listTables();
+                for (String table : snapshotTables) {
                     if (tableFilter.accepts(table)) {
                         createOrReplaceTable(table);
                     }
                 }
-                for (String table : tables) {
+                for (String table : snapshotTables) {
                     if (tableFilter.accepts(table)) {
                         checkpointService.markSnapshotStarted(table);
                         try {
@@ -92,14 +93,14 @@ public class SnapshotService {
                         }
                     }
                 }
-                checkpointService.save(position);
+                checkpointService.save(snapshotBinlogPosition);
                 log.info("Initial snapshot completed binlog={}:{} gtid={}",
-                        position.binlogFile(), position.binlogPosition(), position.gtidSet());
-                return position;
+                        snapshotBinlogPosition.binlogFile(), snapshotBinlogPosition.binlogPosition(), snapshotBinlogPosition.gtidSet());
+                return snapshotBinlogPosition;
             } finally {
-                if (locked) {
-                    try (Statement st = lockConnection.createStatement()) {
-                        st.execute("UNLOCK TABLES");
+                if (sourceReadLockAcquired) {
+                    try (Statement unlockStatement = lockConnection.createStatement()) {
+                        unlockStatement.execute("UNLOCK TABLES");
                     }
                 }
             }
@@ -107,8 +108,8 @@ public class SnapshotService {
     }
 
     private boolean tryReadLock(Connection connection) {
-        try (Statement st = connection.createStatement()) {
-            st.execute("FLUSH TABLES WITH READ LOCK");
+        try (Statement lockStatement = connection.createStatement()) {
+            lockStatement.execute("FLUSH TABLES WITH READ LOCK");
             return true;
         } catch (Exception e) {
             return false;
@@ -116,20 +117,21 @@ public class SnapshotService {
     }
 
     private BinlogPosition currentSourcePosition(Connection connection) throws Exception {
-        String file = null;
-        Long position = null;
+        String binlogFile = null;
+        Long binlogPosition = null;
         SourceLogStatus logStatus = sourceLogStatus(connection);
-        file = logStatus.file();
-        position = logStatus.position();
-        String gtid = null;
-        try (Statement st = connection.createStatement(); ResultSet rs = st.executeQuery("SELECT @@GLOBAL.gtid_executed")) {
-            if (rs.next()) {
-                gtid = rs.getString(1);
+        binlogFile = logStatus.file();
+        binlogPosition = logStatus.position();
+        String gtidSet = null;
+        try (Statement gtidStatement = connection.createStatement();
+             ResultSet gtidResultSet = gtidStatement.executeQuery("SELECT @@GLOBAL.gtid_executed")) {
+            if (gtidResultSet.next()) {
+                gtidSet = gtidResultSet.getString(1);
             }
         } catch (Exception e) {
             log.info("GTID is not available on sourceJdbcTemplate: {}", e.getMessage());
         }
-        return new BinlogPosition(file, position, gtid, "SNAPSHOT", null, LocalDateTime.now());
+        return new BinlogPosition(binlogFile, binlogPosition, gtidSet, "SNAPSHOT", null, LocalDateTime.now());
     }
 
     private SourceLogStatus sourceLogStatus(Connection connection) throws Exception {
@@ -141,12 +143,13 @@ public class SnapshotService {
         }
     }
 
-    private SourceLogStatus readSourceLogStatus(Connection connection, String sql) throws Exception {
-        try (Statement st = connection.createStatement(); ResultSet rs = st.executeQuery(sql)) {
-            if (!rs.next()) {
-                throw new IllegalStateException(sql + " returned no rows; verify log_bin is enabled");
+    private SourceLogStatus readSourceLogStatus(Connection connection, String statusSql) throws Exception {
+        try (Statement statusStatement = connection.createStatement();
+             ResultSet statusResultSet = statusStatement.executeQuery(statusSql)) {
+            if (!statusResultSet.next()) {
+                throw new IllegalStateException(statusSql + " returned no rows; verify log_bin is enabled");
             }
-            return new SourceLogStatus(rs.getString("File"), rs.getLong("Position"));
+            return new SourceLogStatus(statusResultSet.getString("File"), statusResultSet.getLong("Position"));
         }
     }
 
@@ -156,7 +159,7 @@ public class SnapshotService {
 
     private List<String> listTables() {
         List<String> tables = sourceJdbcTemplate.query("SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE'",
-                (rs, rowNum) -> rs.getString(1), sourceDatabaseName);
+                (resultSet, rowNumber) -> resultSet.getString(1), sourceDatabaseName);
         return orderTablesByForeignKeys(tables);
     }
 
@@ -174,9 +177,9 @@ public class SnapshotService {
                           AND REFERENCED_TABLE_SCHEMA = ?
                           AND REFERENCED_TABLE_NAME IS NOT NULL
                         """,
-                rs -> {
-                    String table = rs.getString("TABLE_NAME");
-                    String referencedTable = rs.getString("REFERENCED_TABLE_NAME");
+                foreignKeyResultSet -> {
+                    String table = foreignKeyResultSet.getString("TABLE_NAME");
+                    String referencedTable = foreignKeyResultSet.getString("REFERENCED_TABLE_NAME");
                     if (tableSet.contains(table) && tableSet.contains(referencedTable)) {
                         dependencies.get(table).add(referencedTable);
                     }
@@ -214,12 +217,12 @@ public class SnapshotService {
             log.info("Skipped snapshot DDL because sinkJdbcTemplate table already exists table={}", table);
             return;
         }
-        Map<String, Object> row = sourceJdbcTemplate.queryForMap("SHOW CREATE TABLE " + SqlNames.qualified(sourceDatabaseName, table));
-        String ddl = String.valueOf(row.get("Create Table"));
-        ddl = DdlSanitizer.prepare(ddl, sourceDatabaseName, sinkDatabaseName, strictDdl)
+        Map<String, Object> createTableResult = sourceJdbcTemplate.queryForMap("SHOW CREATE TABLE " + SqlNames.qualified(sourceDatabaseName, table));
+        String sourceCreateTableDdl = String.valueOf(createTableResult.get("Create Table"));
+        String sinkCreateTableDdl = DdlSanitizer.prepare(sourceCreateTableDdl, sourceDatabaseName, sinkDatabaseName, strictDdl)
                 .orElseThrow(() -> new IllegalStateException("CREATE TABLE DDL was skipped for table " + table));
         try {
-            sinkJdbcTemplate.execute(ddl);
+            sinkJdbcTemplate.execute(sinkCreateTableDdl);
         } catch (RuntimeException e) {
             if (!isTableAlreadyExists(e)) {
                 throw e;
@@ -251,38 +254,40 @@ public class SnapshotService {
     }
 
     private long copyTable(String table) throws Exception {
-        List<String> columns = writableColumns(table);
-        if (columns.isEmpty()) {
+        List<String> writableColumns = writableColumns(table);
+        if (writableColumns.isEmpty()) {
             log.warn("Skipping snapshot copy because table has no writable columns table={}", table);
             return 0;
         }
-        String selectColumns = String.join(",", columns.stream().map(SqlNames::quote).toList());
+        String selectColumnsSql = String.join(",", writableColumns.stream().map(SqlNames::quote).toList());
         try (Connection sourceConnection = sourceDataSource.getConnection();
              Connection sinkConnection = sinkDataSource.getConnection();
-             PreparedStatement read = sourceConnection.prepareStatement(
-                     "SELECT " + selectColumns + " FROM " + SqlNames.qualified(sourceDatabaseName, table),
+             PreparedStatement sourceReadStatement = sourceConnection.prepareStatement(
+                     "SELECT " + selectColumnsSql + " FROM " + SqlNames.qualified(sourceDatabaseName, table),
                      ResultSet.TYPE_FORWARD_ONLY,
                      ResultSet.CONCUR_READ_ONLY)) {
-            read.setFetchSize(Integer.MIN_VALUE);
-            try (ResultSet rs = read.executeQuery()) {
-                String placeholders = String.join(",", columns.stream().map(c -> "?").toList());
-                String columnSql = String.join(",", columns.stream().map(SqlNames::quote).toList());
-                String sql = "REPLACE INTO " + SqlNames.qualified(sinkDatabaseName, table) + " (" + columnSql + ") VALUES (" + placeholders + ")";
+            // MySQL streams rows only when fetch size is MIN_VALUE on a forward-only result set.
+            sourceReadStatement.setFetchSize(Integer.MIN_VALUE);
+            try (ResultSet sourceRows = sourceReadStatement.executeQuery()) {
+                String valuePlaceholdersSql = String.join(",", writableColumns.stream().map(column -> "?").toList());
+                String insertColumnListSql = String.join(",", writableColumns.stream().map(SqlNames::quote).toList());
+                String replaceSql = "REPLACE INTO " + SqlNames.qualified(sinkDatabaseName, table)
+                        + " (" + insertColumnListSql + ") VALUES (" + valuePlaceholdersSql + ")";
                 sinkConnection.setAutoCommit(false);
-                int count = 0;
-                try (PreparedStatement write = sinkConnection.prepareStatement(sql)) {
-                    while (rs.next()) {
-                        for (int i = 1; i <= columns.size(); i++) {
-                            write.setObject(i, rs.getObject(i));
+                int copiedRowCount = 0;
+                try (PreparedStatement sinkWriteStatement = sinkConnection.prepareStatement(replaceSql)) {
+                    while (sourceRows.next()) {
+                        for (int columnNumber = 1; columnNumber <= writableColumns.size(); columnNumber++) {
+                            sinkWriteStatement.setObject(columnNumber, sourceRows.getObject(columnNumber));
                         }
-                        write.addBatch();
-                        count++;
-                        if (count % 1000 == 0) {
-                            write.executeBatch();
+                        sinkWriteStatement.addBatch();
+                        copiedRowCount++;
+                        if (copiedRowCount % 1000 == 0) {
+                            sinkWriteStatement.executeBatch();
                             sinkConnection.commit();
                         }
                     }
-                    write.executeBatch();
+                    sinkWriteStatement.executeBatch();
                     sinkConnection.commit();
                 } catch (Exception e) {
                     sinkConnection.rollback();
@@ -290,8 +295,8 @@ public class SnapshotService {
                 } finally {
                     sinkConnection.setAutoCommit(true);
                 }
-                log.info("Copied snapshot table={} rows={}", table, count);
-                return count;
+                log.info("Copied snapshot table={} rows={}", table, copiedRowCount);
+                return copiedRowCount;
             }
         }
     }
@@ -304,7 +309,7 @@ public class SnapshotService {
                           AND EXTRA NOT LIKE '%GENERATED%'
                         ORDER BY ORDINAL_POSITION
                         """,
-                (rs, rowNum) -> rs.getString(1), sourceDatabaseName, table);
+                (resultSet, rowNumber) -> resultSet.getString(1), sourceDatabaseName, table);
     }
 
     private record SourceLogStatus(String file, Long position) {

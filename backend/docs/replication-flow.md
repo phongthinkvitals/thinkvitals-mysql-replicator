@@ -1,252 +1,368 @@
-# MySQL Binlog Replicator - Flow & Operating Docs
+# Backend Replication Flow
 
-Tài liệu này mô tả flow vận hành của app `mysql-binlog-replicator`: initial snapshot, realtime CDC, DDL/DML apply, checkpoint, metadata từng table, resume và error handling.
+This document describes the backend flow for the MySQL binlog replicator. It covers application startup, snapshotting, realtime CDC, DDL/DML application, checkpointing, verification, monitoring APIs, and operational failure behavior.
 
-## 1. Mục tiêu
+The backend is a standalone Spring Boot service. It copies a MySQL source database into a MySQL sink database and then keeps the sink updated by reading the source MySQL binary log directly. It does not use Kafka, Debezium, or an external queue.
 
-App replicate một MySQL source database sang một MySQL sink database bằng cách:
-
-- Chạy initial snapshot khi sink chưa có checkpoint.
-- Tạo schema sink từ source schema.
-- Copy data hiện có từ source sang sink.
-- Ghi checkpoint tại binlog position/GTID của snapshot.
-- Tiếp tục đọc MySQL binlog để apply realtime DDL/DML.
-- Resume từ checkpoint khi app restart.
-
-App không dùng Kafka hoặc Debezium.
-
-## 2. Component Overview
+## 1. High-Level Architecture
 
 ```mermaid
 flowchart LR
     subgraph Source["MySQL Source"]
-        SDB[(Source DB)]
-        BINLOG[(Binary Log)]
+        SourceDb[(Source database)]
+        SourceBinlog[(Binary log)]
     end
 
-    subgraph App["Spring Boot Replicator"]
-        RS[ReplicationService]
-        SS[SnapshotService]
-        DA[DdlApplier]
-        DMA[DmlApplier]
-        MS[MetadataService]
-        CS[CheckpointService]
-        API[MonitoringController]
+    subgraph Backend["Spring Boot backend"]
+        ReplicationService["ReplicationService"]
+        SnapshotService["SnapshotService"]
+        DdlApplier["DdlApplier"]
+        DmlApplier["DmlApplier"]
+        MetadataService["MetadataService"]
+        CheckpointService["CheckpointService"]
+        VerificationService["VerificationService"]
+        MonitoringController["MonitoringController"]
     end
 
     subgraph Sink["MySQL Sink"]
-        TDB[(Target DB)]
-        CP[(replication_checkpoint)]
-        TM[(replication_table_sync_metadata)]
+        SinkDb[(Sink database)]
+        CheckpointTable[(replication_checkpoint)]
+        TableMetadata[(replication_table_sync_metadata)]
     end
 
-    RS --> SS
-    SS --> SDB
-    SS --> TDB
-    RS --> BINLOG
-    RS --> DA
-    RS --> DMA
-    DA --> TDB
-    DMA --> TDB
-    DA --> MS
-    DMA --> MS
-    MS --> SDB
-    MS --> TDB
-    CS --> CP
-    CS --> TM
-    SS --> CS
-    DA --> CS
-    DMA --> CS
-    API --> CS
+    MonitoringController --> ReplicationService
+    MonitoringController --> VerificationService
+    ReplicationService --> SnapshotService
+    ReplicationService --> SourceBinlog
+    ReplicationService --> DdlApplier
+    ReplicationService --> DmlApplier
+    SnapshotService --> SourceDb
+    SnapshotService --> SinkDb
+    DdlApplier --> SinkDb
+    DmlApplier --> SinkDb
+    DdlApplier --> MetadataService
+    DmlApplier --> MetadataService
+    MetadataService --> SourceDb
+    MetadataService --> SinkDb
+    CheckpointService --> CheckpointTable
+    CheckpointService --> TableMetadata
+    SnapshotService --> CheckpointService
+    DdlApplier --> CheckpointService
+    DmlApplier --> CheckpointService
+    VerificationService --> SourceDb
+    VerificationService --> SinkDb
 ```
 
-### Main Classes
+Core responsibilities:
 
-- `ReplicationService`: start/pause/resume loop, connect binlog client, route events.
-- `SnapshotService`: initial snapshot schema + data copy.
-- `DdlApplier`: apply DDL from binlog to sink.
-- `DmlApplier`: apply row-level INSERT/UPDATE/DELETE to sink.
-- `MetadataService`: load source table metadata, ensure missing sink table, widen sink columns in relaxed mode.
-- `DdlSanitizer`: strict/relaxed DDL transformation.
-- `CheckpointService`: global checkpoint, per-table sync metadata, runtime status.
-- `MonitoringController`: `/health`, `/replication/status`, pause/resume API.
+- `ReplicationService`: owns lifecycle, pause/resume state, binlog connection, event routing, and transaction buffering.
+- `SnapshotService`: creates the sink schema and copies existing source data when no checkpoint exists.
+- `DdlApplier`: maps and applies supported DDL events to the sink.
+- `DmlApplier`: applies row-level insert, update, and delete events inside sink transactions.
+- `MetadataService`: loads table metadata, creates missing sink tables, and widens sink columns in relaxed mode.
+- `DdlSanitizer`: converts source DDL into sink-safe strict or relaxed DDL.
+- `CheckpointService`: stores the global resume checkpoint, table-level metadata, and runtime status.
+- `VerificationService`: compares source and sink tables by row count and checksum.
+- `MonitoringController`: exposes health, status, verification, pause, and resume endpoints.
+
+## 2. Backend Entry Points
+
+The backend exposes these HTTP endpoints:
+
+| Endpoint | Auth | Purpose |
+| --- | --- | --- |
+| `GET /health` | No | Liveness check. Returns `{"status":"UP"}`. |
+| `GET /auth/me` | Yes | Returns the authenticated username. |
+| `GET /replication/status` | Yes | Returns the current replication status from `CheckpointService`. |
+| `POST /replication/pause` | Yes | Pauses replication and disconnects the binlog client. |
+| `POST /replication/resume` | Yes | Starts or resumes replication. |
+| `GET /replication/verify?table=<name>&limit=<n>` | Yes | Verifies one table. |
+| `GET /replication/verify/all?limit=<n>` | Yes | Verifies all included tables. |
+
+Security behavior:
+
+- `/health` is public.
+- Every other endpoint requires HTTP Basic authentication.
+- Sessions are stateless and CSRF is disabled because the backend is API-oriented.
 
 ## 3. Startup Flow
 
 ```mermaid
 flowchart TD
-    A[App starts] --> B[CheckpointService creates internal tables]
-    B --> C[ReplicationService.resume]
-    C --> D{replication_checkpoint exists?}
-    D -- No --> E{snapshotMode == initial?}
-    E -- Yes --> F[Run initial snapshot]
-    E -- No --> G[Connect binlog from current/default source state]
-    D -- Yes --> H[Load checkpoint]
-    F --> I[Return snapshot checkpoint]
-    H --> I
-    I --> J{useGtid and gtid_set exists?}
-    J -- Yes --> K[BinaryLogClient.setGtidSet]
-    J -- No --> L[set binlog_file + binlog_position]
-    K --> M[Connect and stream binlog]
-    L --> M
-    G --> M
+    A["Spring Boot starts"] --> B["Create source and sink DataSource beans"]
+    B --> C["CheckpointService parses source/sink JDBC URLs"]
+    C --> D["CheckpointService creates internal sink tables"]
+    D --> E{"replication.autoStart?"}
+    E -- "true" --> F["ReplicationService.resume()"]
+    E -- "false" --> G["Mark status as paused and wait for POST /replication/resume"]
+    F --> H["Submit single replication task"]
+    H --> I["Run snapshot if needed"]
+    I --> J["Connect BinaryLogClient"]
+    J --> K["Stream binlog events"]
 ```
 
-Default behavior:
+Important details:
 
-- `replication.snapshotMode` defaults to `initial`.
-- `replication.strictDdl` defaults to `false`.
-- `replication.requirePrimaryKey` defaults to `true`.
-- `replication.onDuplicateInsert` defaults to `upsert`.
+- Replication runs on a single-thread executor so binlog order is preserved.
+- `replication.autoStart` defaults to `false`, so the service normally waits for an authenticated resume request.
+- The sink internal tables are created on startup before replication begins.
+- Runtime status is kept in memory by `CheckpointService` and refreshed as replication state changes.
 
-## 4. Initial Snapshot Flow
+## 4. Internal Tables
+
+### `replication_checkpoint`
+
+This table stores the single global resume point for the whole source database.
+
+Purpose:
+
+- Keeps binlog file and position when file/position resume is used.
+- Keeps GTID set when GTID resume is used.
+- Stores the last event type, table, and event time.
+- Advances only after the corresponding sink DDL or DML transaction succeeds.
+
+The backend always resumes from this table, not from per-table metadata.
+
+### `replication_table_sync_metadata`
+
+This table stores operational visibility per source table.
+
+Purpose:
+
+- Tracks snapshot status: `RUNNING`, `COMPLETED`, or `FAILED`.
+- Stores copied row count for snapshot operations.
+- Stores last applied table-level binlog metadata.
+- Stores the last table-level error or verification mismatch.
+
+This table is useful for dashboards and troubleshooting, but it does not control global binlog ordering.
+
+## 5. Resume Decision Flow
 
 ```mermaid
 flowchart TD
-    A[Snapshot starts] --> B[Try FLUSH TABLES WITH READ LOCK]
-    B --> C{Lock success?}
-    C -- Yes --> D[Reads are consistent while lock is held]
-    C -- No --> E[Log warning: snapshot may be inconsistent if source is writing]
-    D --> F[Read source binlog file/position and GTID]
+    A["Replication task starts"] --> B["SnapshotService.runIfNeeded()"]
+    B --> C{"replication_checkpoint exists?"}
+    C -- "Yes" --> D["Return saved checkpoint"]
+    C -- "No" --> E{"snapshotMode == initial?"}
+    E -- "Yes" --> F["Run initial snapshot"]
+    E -- "No" --> G["Return null checkpoint"]
+    D --> H["Connect binlog client"]
+    F --> H
+    G --> H
+    H --> I{"Checkpoint has binlog file and position?"}
+    I -- "Yes" --> J["setBinlogFilename + setBinlogPosition"]
+    I -- "No" --> K{"useGtid and checkpoint has GTID set?"}
+    K -- "Yes" --> L["setGtidSet"]
+    K -- "No" --> M["Connect without explicit checkpoint"]
+    J --> N["Start streaming events"]
+    L --> N
+    M --> N
+```
+
+Resume behavior:
+
+- If a checkpoint exists, the backend resumes from it.
+- If no checkpoint exists and `snapshotMode=initial`, the backend snapshots the source first.
+- If no checkpoint exists and snapshot mode is not `initial`, the binlog client connects without a saved checkpoint.
+- File/position resume is preferred when both binlog file and position are present.
+- GTID resume is used when configured and a GTID set is available.
+
+## 6. Initial Snapshot Flow
+
+```mermaid
+flowchart TD
+    A["No checkpoint found"] --> B["Try FLUSH TABLES WITH READ LOCK"]
+    B --> C{"Read lock acquired?"}
+    C -- "Yes" --> D["Source writes are blocked during checkpoint capture and copy"]
+    C -- "No" --> E["Log warning: snapshot can be inconsistent if source writes continue"]
+    D --> F["Read source binary log status"]
     E --> F
-    F --> G[Create sink database if needed]
-    G --> H[List source tables]
-    H --> I[Sort tables by FK dependency]
-    I --> J[Create sink tables]
-    J --> K[Copy rows table by table]
-    K --> L[Mark per-table snapshot metadata]
-    L --> M[Save global checkpoint]
-    M --> N[Unlock source tables if lock was acquired]
-    N --> O[Start realtime CDC from checkpoint]
+    F --> G["Read @@GLOBAL.gtid_executed when available"]
+    G --> H["Create sink database if needed"]
+    H --> I["List source base tables"]
+    I --> J["Order tables by foreign-key dependencies"]
+    J --> K["Create missing sink tables"]
+    K --> L["Copy accepted tables with REPLACE INTO"]
+    L --> M["Save snapshot checkpoint"]
+    M --> N["Unlock source tables if lock was acquired"]
+    N --> O["Return checkpoint to ReplicationService"]
 ```
 
-Snapshot table handling:
+Detailed behavior:
 
-1. `SnapshotService` lists base tables in source database.
-2. Tables are ordered by foreign-key dependency so parent tables are created/copied before child tables.
-3. Each accepted table is created on sink.
-4. Each accepted table is copied using `REPLACE INTO`.
-5. `replication_table_sync_metadata` is updated:
-   - `snapshot_status = RUNNING` before copy.
-   - `snapshot_status = COMPLETED`, `snapshot_rows_copied = <count>` after copy.
-   - `snapshot_status = FAILED`, `last_error = <error>` if copy fails.
+1. `CheckpointService.load()` checks whether a global checkpoint already exists.
+2. If there is no checkpoint and `snapshotMode=initial`, snapshot begins.
+3. `SnapshotService` tries `FLUSH TABLES WITH READ LOCK`.
+4. It reads the source binlog file/position using `SHOW BINARY LOG STATUS`, with fallback to `SHOW MASTER STATUS`.
+5. It reads `@@GLOBAL.gtid_executed` when GTID is available.
+6. It creates the sink database if needed.
+7. It lists source base tables and sorts them by foreign-key dependency.
+8. It creates each accepted sink table from source `SHOW CREATE TABLE`.
+9. It copies rows table by table using streamed source reads and batched sink writes.
+10. It marks each table snapshot as started, completed, or failed in `replication_table_sync_metadata`.
+11. It saves the snapshot checkpoint after copy finishes.
+12. It releases the source read lock if it was acquired.
 
-## 5. Realtime CDC Flow
+The source read lock matters because the snapshot checkpoint must match the copied source state. If the source user cannot acquire the lock, the backend still continues, but concurrent source writes can make the initial snapshot inconsistent.
+
+## 7. Table Filtering
+
+Filtering is handled by `TableFilter`.
+
+Rules:
+
+- If `includeTables` is empty, every source table is included unless excluded.
+- If `includeTables` has values, only listed tables are included.
+- `excludeTables` removes tables from replication.
+- Internal tables should be excluded if they exist in the source database.
+
+Example:
+
+```yaml
+replication:
+  includeTables: []
+  excludeTables:
+    - flyway_schema_history
+    - replication_checkpoint
+    - replication_table_sync_metadata
+```
+
+Filtering is applied during both snapshot and realtime row-event handling.
+
+## 8. Realtime Binlog Event Flow
 
 ```mermaid
 flowchart TD
-    A[Binlog event received] --> B{Event type}
-    B -- GTID --> C[Store current GTID in handler]
-    B -- TABLE_MAP --> D[Map tableId to database/table]
-    B -- WRITE_ROWS --> E[Collect INSERT row changes]
-    B -- UPDATE_ROWS --> F[Collect UPDATE row changes]
-    B -- DELETE_ROWS --> G[Collect DELETE row changes]
-    B -- QUERY --> H[Handle BEGIN/COMMIT/DDL]
-    B -- XID --> I[Commit collected DML transaction]
+    A["BinaryLogClient receives event"] --> B{"Event data type"}
+    B -- "GTID" --> C["Store current GTID in handler"]
+    B -- "TABLE_MAP" --> D["Map tableId to source database/table"]
+    B -- "WRITE_ROWS" --> E["Collect INSERT row images"]
+    B -- "UPDATE_ROWS" --> F["Collect UPDATE before/after images"]
+    B -- "DELETE_ROWS" --> G["Collect DELETE row images"]
+    B -- "QUERY" --> H["Handle BEGIN, COMMIT, or DDL"]
+    B -- "XID" --> I["Commit buffered DML transaction"]
 
-    E --> J{Table database == configured source DB?}
+    E --> J{"Table belongs to configured source database?"}
     F --> J
     G --> J
-    J -- No --> K[Ignore row event]
-    J -- Yes --> L{include/exclude accepts table?}
-    L -- No --> K
-    L -- Yes --> M[Add RowChange to transaction buffer]
+    J -- "No" --> K["Ignore event"]
+    J -- "Yes" --> L{"Table accepted by include/exclude filter?"}
+    L -- "No" --> K
+    L -- "Yes" --> M["Append RowChange to pending transaction buffer"]
 
-    I --> N{transaction empty?}
-    N -- Yes --> O[Ignore commit]
-    N -- No --> P[DmlApplier.applyTransaction]
-    P --> Q[Commit sink transaction and checkpoint]
+    H --> N{"DDL query?"}
+    N -- "Yes" --> O["DdlApplier.apply()"]
+    N -- "No" --> P["Update transaction buffer state"]
+
+    I --> Q{"Buffer empty?"}
+    Q -- "Yes" --> R["Ignore commit"]
+    Q -- "No" --> S["DmlApplier.applyTransaction()"]
 ```
 
 Important behavior:
 
+- `TABLE_MAP` events are required to resolve row events from table IDs to table names.
 - Row events from other databases are ignored.
-- Single-thread apply preserves binlog order.
-- DML changes are buffered until commit.
-- Sink transaction is committed only after all row changes and checkpoint update succeed.
-- If apply fails, sink transaction is rolled back and checkpoint is not advanced.
+- Row changes are buffered until the transaction commit event.
+- `BEGIN` clears the pending transaction buffer.
+- `COMMIT` or `XID` causes the buffered row changes to be applied atomically.
+- If pause is requested, the handler disconnects the binlog client.
 
-## 6. DML Apply Flow
+## 9. DML Apply Flow
 
 ```mermaid
 flowchart TD
-    A[Apply transaction] --> B[Open sink connection]
-    B --> C[setAutoCommit false]
-    C --> D[For each RowChange]
-    D --> E[Ensure sink table exists]
-    E --> F[Load source metadata columns + PK]
-    F --> G{Change kind}
-    G -- INSERT --> H[INSERT ... ON DUPLICATE KEY UPDATE]
-    G -- UPDATE --> I[UPDATE by primary key]
-    G -- DELETE --> J[DELETE by primary key]
-
-    I --> K{affected rows == 0?}
-    K -- Yes --> L[Apply after image as insert/upsert]
-    K -- No --> M[Continue]
-    H --> M
-    J --> M
+    A["DmlApplier.applyTransaction(changes, commitPosition)"] --> B{"Changes empty?"}
+    B -- "Yes" --> C["Save checkpoint only"]
+    B -- "No" --> D["Open sink connection"]
+    D --> E["Disable auto-commit"]
+    E --> F["Apply each RowChange in order"]
+    F --> G["Ensure sink table exists"]
+    G --> H["Load source table metadata"]
+    H --> I{"RowChange kind"}
+    I -- "INSERT" --> J["INSERT into sink"]
+    I -- "UPDATE" --> K["UPDATE sink row by primary key"]
+    I -- "DELETE" --> L["DELETE sink row by primary key"]
+    J --> M["Next change"]
+    K --> M
     L --> M
-    M --> N{More changes?}
-    N -- Yes --> D
-    N -- No --> O[Save global checkpoint]
-    O --> P[Save per-table metadata]
-    P --> Q[Commit sink transaction]
+    M --> N{"All changes applied?"}
+    N -- "No" --> F
+    N -- "Yes" --> O["Save global checkpoint on same connection"]
+    O --> P["Save per-table event metadata on same connection"]
+    P --> Q["Commit sink transaction"]
+    Q --> R["Refresh runtime status"]
 ```
 
-### INSERT
+Transaction guarantees:
 
-Default mode:
+- Row changes and checkpoint update share the same sink transaction.
+- If any row fails, the sink transaction is rolled back.
+- The global checkpoint is not advanced when DML apply fails.
+- Failed tables are marked with `last_error` when table context is available.
 
-```sql
-INSERT INTO sink_table (...) VALUES (...)
-ON DUPLICATE KEY UPDATE ...
-```
+Insert behavior:
 
-This makes restart/retry safer when the same event is replayed.
+- Default `onDuplicateInsert=upsert` adds `ON DUPLICATE KEY UPDATE`.
+- This makes replay safer if the same insert is seen again after restart or retry.
 
-### UPDATE
+Update behavior:
 
-Default:
+- Updates use primary keys in the `WHERE` clause.
+- Non-primary-key columns are updated from the after image.
+- If no row is affected, the backend applies the after image as an insert/upsert.
 
-```sql
-UPDATE sink_table
-SET non_pk_col = ?
-WHERE pk = ?
-```
+Delete behavior:
 
-If the row does not exist on sink, app applies the `after` image as insert/upsert.
+- Deletes use primary keys in the `WHERE` clause.
+- If no row is affected, the backend logs a warning and continues.
 
-### DELETE
+Primary key requirement:
 
-Default:
+- `UPDATE` and `DELETE` require a primary key by default.
+- This is controlled by `replication.requirePrimaryKey`.
+- Without a primary key, row updates and deletes are ambiguous on the sink.
 
-```sql
-DELETE FROM sink_table WHERE pk = ?
-```
-
-If row does not exist on sink, app logs warning and continues.
-
-## 7. DDL Apply Flow
+## 10. DML Recovery Flow
 
 ```mermaid
 flowchart TD
-    A[QUERY binlog event] --> B{Supported DDL?}
-    B -- No --> C[Ignore]
-    B -- Yes --> D{query.database == source DB?}
-    D -- No --> C
-    D -- Yes --> E[DdlSanitizer.prepare]
-    E --> F{strictDdl?}
-    F -- true --> G[Map source schema to sink schema and apply as-is]
-    F -- false --> H[Relax DDL]
-    H --> I{DDL skipped?}
-    I -- Yes --> J[Save checkpoint and table metadata]
-    I -- No --> K[Execute relaxed DDL on sink]
-    G --> K
-    K --> L[Invalidate metadata cache]
-    L --> M[Save checkpoint and table metadata]
+    A["DML apply fails"] --> B{"Failure type"}
+    B -- "Missing sink table" --> C["Invalidate metadata cache"]
+    C --> D["Create sink table from source SHOW CREATE TABLE"]
+    D --> E["Retry current row change"]
+    B -- "Data too long and strictDdl=false" --> F["Find truncated column"]
+    F --> G["Widen sink column using relaxed type"]
+    G --> H["Retry current row change"]
+    B -- "Other failure" --> I["Rollback transaction and rethrow"]
+    E --> J{"Retry success?"}
+    H --> J
+    J -- "Yes" --> K["Continue transaction"]
+    J -- "No" --> I
 ```
 
-Supported DDL:
+The recovery logic exists because relaxed DDL mode intentionally simplifies the sink schema. If a sink table is missing or a column is too narrow, the backend can repair the sink schema once and retry the current event inside the same overall apply attempt.
+
+## 11. DDL Apply Flow
+
+```mermaid
+flowchart TD
+    A["QUERY binlog event"] --> B{"DDL enabled?"}
+    B -- "No" --> C["Ignore"]
+    B -- "Yes" --> D{"Supported DDL statement?"}
+    D -- "No" --> C
+    D -- "Yes" --> E{"Query database matches source database?"}
+    E -- "No" --> C
+    E -- "Yes" --> F["DdlSanitizer.prepare()"]
+    F --> G{"Sanitizer returned SQL?"}
+    G -- "No" --> H["Skip relaxed DDL"]
+    H --> I["Invalidate metadata cache"]
+    I --> J["Save checkpoint and table metadata"]
+    G -- "Yes" --> K["Execute sink DDL"]
+    K --> I
+```
+
+Supported DDL prefixes:
 
 - `CREATE TABLE`
 - `ALTER TABLE`
@@ -256,115 +372,143 @@ Supported DDL:
 - `CREATE INDEX`
 - `DROP INDEX`
 
-## 8. Strict vs Relaxed DDL
+Failure behavior:
 
-### strictDdl=true
+- If DDL execution succeeds, metadata cache is invalidated and checkpoint is advanced.
+- If relaxed mode skips index/constraint-only DDL, checkpoint is still advanced.
+- If `CREATE TABLE` fails because the sink table already exists, the event is skipped and checkpointed.
+- Other DDL failures stop replication and leave the checkpoint unchanged.
 
-DDL is applied closely to source after schema mapping.
+## 12. Strict vs Relaxed DDL
 
-Use this when the sink must preserve source constraints/indexes exactly.
+### `strictDdl=true`
 
-Tradeoff:
+Strict mode maps the source database name to the sink database name and applies DDL as closely as possible to the source.
 
-- Foreign-key dependency and existing sink objects can block apply.
+Use strict mode when the sink must preserve source constraints and indexes exactly.
+
+Tradeoffs:
+
+- Foreign keys, unique constraints, and existing sink objects can block replication.
 - DDL failures stop the pipeline.
-- Checkpoint is not advanced on failure.
+- The checkpoint is not advanced on failure.
 
-### strictDdl=false
+### `strictDdl=false`
 
-This is the default.
+Relaxed mode is the default. It intentionally makes the sink schema easier to write into.
 
-Sink DDL is intentionally relaxed to make replication resilient:
+Relaxed `CREATE TABLE` behavior:
 
-- `CREATE TABLE` keeps writable columns and `PRIMARY KEY`.
-- Non-primary-key text columns are widened to `longtext`.
-- Non-primary-key binary/blob columns are widened to `longblob`.
-- Generated columns are skipped.
-- `DEFAULT`, `ON UPDATE`, `AUTO_INCREMENT`, `NOT NULL`, per-column charset/collation and comments are removed.
-- Foreign keys, unique keys, secondary indexes, fulltext/spatial indexes and checks are removed.
-- Table options such as `ENGINE`, `AUTO_INCREMENT`, default charset/collation are removed.
-- Index/constraint-only DDL is skipped and checkpointed.
+- Keeps writable source columns.
+- Keeps the primary key.
+- Widens non-primary-key text-like columns to `longtext`.
+- Widens non-primary-key binary/blob columns to `longblob`.
+- Skips generated columns.
+- Removes defaults, `ON UPDATE`, `AUTO_INCREMENT`, `NOT NULL`, column comments, and per-column charset/collation.
+- Removes foreign keys, unique constraints, secondary indexes, fulltext/spatial indexes, and checks.
+- Removes table options such as `ENGINE`, `AUTO_INCREMENT`, default charset, and default collation.
+
+Relaxed DDL event behavior:
+
+- Index-only and constraint-only DDL can be skipped and checkpointed.
 - Column-changing DDL is still applied.
+- Sink columns can be widened later if DML detects a truncation error.
 
-This mode is useful for a backup/reporting sink where the goal is easy data sync, not enforcing the full source schema.
+Relaxed mode is best for a backup, reporting, analytics, or operational mirror sink where data sync is more important than enforcing every source-side constraint.
 
-## 9. Checkpoint Flow
-
-```mermaid
-flowchart TD
-    A[Apply event/transaction] --> B{Apply success?}
-    B -- No --> C[Rollback if DML transaction]
-    C --> D[Do not advance global checkpoint]
-    D --> E[Record table last_error when available]
-    B -- Yes --> F[Save replication_checkpoint]
-    F --> G[Save replication_table_sync_metadata]
-    G --> H[Commit sink transaction for DML]
-```
-
-Global checkpoint table:
-
-```sql
-replication_checkpoint
-```
-
-Purpose:
-
-- Single ordered resume point for the full source database.
-- Stores binlog file/position or GTID.
-- Updated only after successful apply.
-
-Per-table metadata table:
-
-```sql
-replication_table_sync_metadata
-```
-
-Purpose:
-
-- Operational visibility per table.
-- Shows snapshot status, rows copied, last table-level event, last error.
-- Does not control resume ordering.
-
-Resume always uses `replication_checkpoint`, not the per-table metadata table.
-
-## 10. Resume Flow
+## 13. Checkpoint Flow
 
 ```mermaid
 flowchart TD
-    A[App restart] --> B[Load replication_checkpoint]
-    B --> C{Checkpoint exists?}
-    C -- No --> D[Run initial snapshot if snapshotMode=initial]
-    C -- Yes --> E{useGtid and gtid_set exists?}
-    E -- Yes --> F[Resume using GTID set]
-    E -- No --> G[Resume using binlog file/position]
-    F --> H[Read binlog from checkpoint]
-    G --> H
-    H --> I[Apply next events in order]
+    A["Apply DDL or DML transaction"] --> B{"Apply success?"}
+    B -- "No" --> C["Rollback DML transaction if active"]
+    C --> D["Do not advance replication_checkpoint"]
+    D --> E["Record table last_error when table context exists"]
+    B -- "Yes" --> F{"DML transaction?"}
+    F -- "Yes" --> G["Save checkpoint using same sink connection"]
+    G --> H["Save table event metadata using same sink connection"]
+    H --> I["Commit sink transaction"]
+    F -- "No" --> J["Save checkpoint"]
+    J --> K["Save table event metadata"]
 ```
 
-If binlog needed by checkpoint has been purged, app cannot safely continue without data loss. The correct recovery is to reset sink/checkpoint and run a fresh initial snapshot, or restore a source with the required binlog/GTID history.
+Why checkpointing is global:
 
-## 11. Error Handling
+- MySQL binlog order is global across tables.
+- Replaying from a single ordered checkpoint avoids gaps between tables.
+- Per-table metadata is observational and must not be used as the resume source.
+
+If a checkpoint references a purged binlog file, the backend cannot safely continue from file/position. Recovery requires restoring the needed binlog/GTID history or rebuilding the sink from a fresh snapshot.
+
+## 14. Verification Flow
 
 ```mermaid
 flowchart TD
-    A[Apply operation fails] --> B{Recoverable local schema issue?}
-    B -- Missing sink table --> C[Create table from source SHOW CREATE TABLE]
-    B -- Data too long in relaxed mode --> D[Widen sink column then retry]
-    B -- CREATE TABLE already exists --> E[Skip and checkpoint]
-    B -- Other error --> F[Retry according to retry policy]
-    C --> G[Retry current event]
-    D --> G
-    E --> H[Continue]
-    G --> I{Retry success?}
-    I -- Yes --> H
-    I -- No --> F
-    F --> J{Attempts exhausted?}
-    J -- No --> K[Backoff and reconnect from checkpoint]
-    J -- Yes --> L[Stop replication and keep checkpoint unchanged]
+    A["Verification request"] --> B{"Single table or all tables?"}
+    B -- "Single" --> C["Validate table name and filter"]
+    B -- "All" --> D["List source base tables"]
+    D --> E["Skip tables rejected by filter"]
+    E --> C
+    C --> F["Load table metadata"]
+    F --> G{"Primary key exists?"}
+    G -- "No" --> H["Return comparable=false"]
+    G -- "Yes" --> I{"Writable columns exist?"}
+    I -- "No" --> H
+    I -- "Yes" --> J["Build checksum SQL"]
+    J --> K["Query source row count and checksums"]
+    K --> L["Query sink row count and checksums"]
+    L --> M{"Counts and checksums match?"}
+    M -- "Yes" --> N["Mark integrity verified"]
+    M -- "No" --> O["Mark integrity failure"]
 ```
 
-Retry config:
+Checksum behavior:
+
+- Verification compares source and sink row counts.
+- It also compares `BIT_XOR(CRC32(...))` and `SUM(CRC32(...))`.
+- Only replicated writable columns are included.
+- Generated columns are excluded.
+- Limited verification orders by primary key and checks the first `N` rows.
+
+Limit tradeoff:
+
+- Full verification scans the whole table on both databases.
+- `limit` is faster for large tables, but it is a sample and not a full proof of equality.
+- Tables without primary keys are not comparable for deterministic limited verification.
+
+## 15. Pause and Resume Flow
+
+```mermaid
+flowchart TD
+    A["POST /replication/pause"] --> B["Set paused=true"]
+    B --> C["Disconnect current BinaryLogClient"]
+    C --> D["Refresh status: running=false, paused=true"]
+
+    E["POST /replication/resume"] --> F{"Already running?"}
+    F -- "Yes" --> G["Set paused=false and refresh status"]
+    F -- "No" --> H["Set paused=false"]
+    H --> I["Submit replication task"]
+```
+
+Pause does not delete checkpoint data. Resume continues from the last successfully saved checkpoint.
+
+## 16. Retry and Fatal Error Flow
+
+```mermaid
+flowchart TD
+    A["Replication runLoop starts"] --> B["Retryer.run('replication')"]
+    B --> C["Run snapshot/connect/binlog stream"]
+    C --> D{"Failure thrown?"}
+    D -- "No" --> E["Continue streaming"]
+    D -- "Yes" --> F{"Attempts remaining?"}
+    F -- "Yes" --> G["Sleep retry.backoffMs"]
+    G --> C
+    F -- "No" --> H["Set running=false"]
+    H --> I["Store error in runtime status"]
+    I --> J["Log fatal replication error"]
+```
+
+Retry defaults:
 
 ```yaml
 retry:
@@ -372,43 +516,66 @@ retry:
   backoffMs: 3000
 ```
 
-On fatal failure:
+Fatal failure behavior:
 
-- App stops replication.
-- Global checkpoint is not advanced.
-- Per-table `last_error` is updated when table context is available.
-- Restart/retry will replay from the old checkpoint.
+- Replication stops.
+- The last successful checkpoint remains unchanged.
+- A future resume retries from the old checkpoint.
+- Table-level errors are recorded when the failing operation has table context.
 
-## 12. Filtering
+## 17. Configuration Flow
+
+Minimum source requirements:
+
+```sql
+log_bin = ON
+binlog_format = ROW
+binlog_row_image = FULL
+server_id = unique
+```
+
+Typical replication configuration:
 
 ```yaml
+source:
+  url: jdbc:mysql://localhost:3309/thinkvitals?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+  username: root
+  password: password
+
+sink:
+  url: jdbc:mysql://localhost:3310/thinkvitals?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+  username: root
+  password: password
+
 replication:
+  serverId: 987654
+  autoStart: false
+  useGtid: true
+  snapshotMode: initial
+  ddlEnabled: true
+  strictDdl: false
+  dmlEnabled: true
   includeTables: []
   excludeTables:
     - flyway_schema_history
     - replication_checkpoint
-```
-
-Rules:
-
-- If `includeTables` is empty, all source tables are included unless excluded.
-- If `includeTables` has values, only listed tables are included.
-- `excludeTables` wins over include/default.
-- Internal tables should be excluded if they exist in source.
-
-Recommended excludes:
-
-```yaml
-replication:
-  excludeTables:
-    - flyway_schema_history
-    - replication_checkpoint
     - replication_table_sync_metadata
+  onDuplicateInsert: upsert
+  requirePrimaryKey: true
 ```
 
-## 13. Operational Queries
+Key defaults:
 
-Check global checkpoint:
+- `autoStart=false`: replication waits for an authenticated resume request.
+- `snapshotMode=initial`: the backend snapshots when no checkpoint exists.
+- `useGtid=true`: GTID is used when the checkpoint has a GTID set.
+- `strictDdl=false`: relaxed sink schema is used by default.
+- `onDuplicateInsert=upsert`: inserts are idempotent by default.
+- `requirePrimaryKey=true`: updates and deletes require primary keys.
+
+## 18. Operational Queries
+
+Check the global checkpoint:
 
 ```sql
 SELECT *
@@ -441,29 +608,36 @@ WHERE last_error IS NOT NULL
 ORDER BY updated_at DESC;
 ```
 
-Check API status:
+Check backend status:
 
 ```bash
 curl http://localhost:8080/health
-curl http://localhost:8080/replication/status
+curl -u admin:admin123 http://localhost:8080/replication/status
 ```
 
-Pause/resume:
+Pause and resume replication:
 
 ```bash
-curl -X POST http://localhost:8080/replication/pause
-curl -X POST http://localhost:8080/replication/resume
+curl -u admin:admin123 -X POST http://localhost:8080/replication/pause
+curl -u admin:admin123 -X POST http://localhost:8080/replication/resume
 ```
 
-## 14. Production Notes
+Run verification:
 
-- Binlog retention must be longer than expected app downtime.
-- For large databases, binlog retention should cover initial snapshot duration plus operational buffer.
-- Use GTID when source supports it.
-- Keep `serverId` unique per replicator instance.
-- Keep `binlog_format=ROW` and `binlog_row_image=FULL`.
-- If source user cannot run `FLUSH TABLES WITH READ LOCK`, snapshot may be inconsistent while source writes continue.
-- For strict schema replicas, use `strictDdl=true`.
-- For easy backup/reporting sync, keep default `strictDdl=false`.
-- Do not run multiple app instances applying to the same sink/checkpoint unless leader election is added.
+```bash
+curl -u admin:admin123 "http://localhost:8080/replication/verify?table=user_model"
+curl -u admin:admin123 "http://localhost:8080/replication/verify/all?limit=10000"
+```
 
+## 19. Production Notes
+
+- Keep binlog retention longer than the maximum expected backend downtime.
+- For large databases, binlog retention must also cover initial snapshot duration.
+- Use GTID when the source supports it.
+- Keep `replication.serverId` unique for every replicator instance that connects to the source.
+- Keep source MySQL configured with `binlog_format=ROW` and `binlog_row_image=FULL`.
+- Grant the source user `SELECT`, `RELOAD`, `LOCK TABLES`, `REPLICATION SLAVE`, and `REPLICATION CLIENT`.
+- If the source user cannot run `FLUSH TABLES WITH READ LOCK`, snapshot consistency depends on whether source writes happen during copy.
+- Use `strictDdl=true` only when the sink must enforce the same constraints and indexes as the source.
+- Keep `strictDdl=false` for backup, reporting, or mirror sinks that prioritize resilient data sync.
+- Do not run multiple backend instances against the same sink checkpoint unless leader election or external locking is added.
